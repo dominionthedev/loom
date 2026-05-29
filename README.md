@@ -206,7 +206,7 @@ Everything lives under `.loom/`:
 
 <p align="center">
     <a href="https://dominionthedev.github.io">
-        <img src="https://raw.githubusercontent.com/dominionthedev/dominionthedev/main/assets/watermark-animated.svg"/>
+        <img src="https://raw.githubusercontent.com/dominionthedev/dominionthedev/main/assets/watermark-animated.svg" width="600" />
     </a>
 </p>
 
