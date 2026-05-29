@@ -1,0 +1,10 @@
+# Runbox — auto-generated
+# Commit: box.toml, box.lock, .runbox/bin/, .runbox/data/ (selectively)
+
+home/
+lib/
+tmp/
+cache/
+state/
+logs/
+sandbox/

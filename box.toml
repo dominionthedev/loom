@@ -1,0 +1,21 @@
+# box.toml — Runbox environment declaration
+# https://github.com/dominionthedev/runbox
+
+[box]
+name = "loom"
+version = "1"
+
+[env]
+OLLAMA_HOST = "http://localhost:11434"
+GO111MODULE = "auto"
+GOTOOLCHAIN = "local"
+
+[tools]
+go = ">=1.22"
+
+[shell]
+mode = "isolated"
+
+[isolation]
+home = "./.runbox/home"
+binary_strategy = "local"
