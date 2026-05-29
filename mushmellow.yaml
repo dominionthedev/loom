@@ -1,0 +1,33 @@
+version: 1
+name: loom
+
+mushmellows:
+  build:
+    description: Build the loom binary
+    puffs:
+      - id: build
+        run: go build -o bin/loom ./
+
+  tidy:
+    description: Tidy go modules
+    puffs:
+      - id: tidy
+        run: go mod tidy
+
+  inspect:
+    description: Inspect the fix example workflow
+    puffs:
+      - id: inspect
+        run: go run ./ inspect examples/fix.lua
+
+  dry-run:
+    description: Dry run the fix example
+    puffs:
+      - id: dry
+        run: go run ./ run examples/fix.lua --dry-run
+
+  clean:
+    description: Remove build artifacts
+    puffs:
+      - id: clean
+        run: rm -rf bin/
