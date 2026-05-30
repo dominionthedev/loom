@@ -132,6 +132,13 @@ func (s *Store) SaveState(key string, v any) error {
 	return os.WriteFile(filepath.Join(s.root, "state", key+".json"), data, 0o644)
 }
 
+// DeleteArtifact removes an artifact and its sidecar from .loom/artifacts/.
+func (s *Store) DeleteArtifact(name string) error {
+	path := filepath.Join(s.ArtifactsDir(), name)
+	_ = os.Remove(path + ".meta.json")
+	return os.Remove(path)
+}
+
 // LoadState reads state JSON from .loom/state/<key>.json into v.
 func (s *Store) LoadState(key string, v any) error {
 	data, err := os.ReadFile(filepath.Join(s.root, "state", key+".json"))
