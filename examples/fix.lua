@@ -1,15 +1,13 @@
 -- fix.lua
--- Loom workflow: analyse failures, plan a fix, implement it, verify.
--- Demonstrates: agents, scope, policy, rule, use(), tasks,
--- checkpoints, worktrees, memory, export/depends_on, guard, review
-
--- ── Environment setup ──────────────────────────────────────────────────────
+-- Loom workflow: analyse failures, plan a fix, implement, verify.
+-- Demonstrates: table DSL syntax, depends_on order, artifact ref/create,
+-- checkpoint with worktree, clean() for isolated verify, guard, review.
 
 local model = "gemma4:32b"
 
 local dev_agent = agent("dev", {
     model  = model,
-    system = "You are an experienced developer. Be precise. Minimal changes only.",
+    system = "You are an experienced developer. Precise. Minimal changes only.",
     think  = "medium"
 })
 
@@ -19,22 +17,13 @@ local planner_agent = agent("planner", {
     think  = "high"
 })
 
-local reviewer_agent = agent("reviewer", {
-    model  = model,
-    system = "You review plans critically. Flag ambiguities and risks.",
-    think  = "medium"
-})
-
--- Scope: what the agent can see and touch
 local impl_scope = scope("implementation", {
     include = {
         "**/*.go",
         "**/*_test.go",
-        "go.mod",
-        "go.sum"
+        "go.mod"
     },
     exclude = {
-        ".git",
         ".loom/**",
         gitignored
     },
@@ -47,7 +36,6 @@ local impl_scope = scope("implementation", {
     }
 })
 
--- Policies: restrict what execute() can do
 local no_git = policy("no-git", {
     kind   = "deny",
     target = "process.execute",
@@ -60,28 +48,16 @@ local no_mod = policy("no-go-mod", {
     match  = { "go mod *", "go get *" }
 })
 
--- Rules: behavioral constraints on the agent
 local dev_rules = rule("dev-rules", {
     "do not modify go.sum or go.mod",
     "do not add new dependencies",
-    "minimal changes — only what is necessary to fix the issue",
-    "preserve existing code style and conventions",
+    "minimal changes only",
+    "preserve existing code style",
 })
 
--- Notification script on failure
-script("on-fail-notify", {
-    source  = ".loom/scripts/notify.lua",
-    trigger = "on_failure",
-    require = "low"
-})
+memory({ persist = true, location = "local" })
 
--- Wire the environment together
-memory({
-    persist  = true,
-    location = "local"
-})
-
-use("defaults", {
+use({
     agent    = dev_agent,
     scope    = impl_scope,
     policies = { no_git, no_mod },
@@ -91,119 +67,102 @@ use("defaults", {
 -- ── Task 1: Analyse ────────────────────────────────────────────────────────
 
 task("analyse", {
-
     step("run-tests", {
         execute("go test ./... 2>&1"),
         export()
     }),
 
     step("read-source", {
+        depends_on("run-tests"),
         glob("**/*.go"),
         read(),
-        depends_on("run-tests"),
         export()
     }),
 
     step("analyse-failures", {
-        think("medium"),
-        reason(
-            "Analyse the test output and source code. " ..
-            "Identify the root cause of each failure. " ..
-            "Note affected files and functions."
-        ),
-        read(),
         depends_on("read-source"),
+        think("medium"),
+        reason("Analyse the test output and source. Identify root cause of each failure."),
         export()
     })
-
 })
 
 -- ── Task 2: Plan ───────────────────────────────────────────────────────────
 
--- Switch to planner agent for this task
 use({
-    agent = planner_agent
+    agent    = planner_agent,
+    scope    = impl_scope,
+    policies = { no_git, no_mod },
+    rules    = { dev_rules }
 })
 
 task("plan", {
-
     step("create-plan", {
-        think("high"),
-        plan(
-            "Based on the analysis, create a precise implementation plan. " ..
-            "List each change: file, function, what to change and why. " ..
-            "Order changes by dependency."
-        ),
-        write(artifacts),
         depends_on("analyse-failures"),
+        -- plan() always runs at high thinking — no think() needed
+        plan("Create a precise implementation plan. List each change: file, function, what and why."),
+        write(artifacts),
         artifacts("fix-plan.md"),
         export()
     }),
 
     step("review-plan", {
-        review("reviewer"),       -- reviewer agent critiques the plan
-        artifacts("fix-plan.md"), -- reference the plan
-        guard("important"),       -- password/touchid before continuing
-        export()
+        depends_on("create-plan"),
+        artifacts("fix-plan.md"), -- reference: load into context
+        reason("Review the plan. Is it complete, precise, and safe?"),
+        guard("important")
     })
-
 })
 
--- Checkpoint: create worktree before touching the project
+-- Checkpoint: snapshot + create worktree before touching the project.
 checkpoint("before-implementation", {
     type   = worktree,
-    review = "artifacts/fix-plan.md"
+    review = "fix-plan.md"
 })
 
 -- ── Task 3: Implement ──────────────────────────────────────────────────────
 
 use({
-    agent = dev_agent
+    agent    = dev_agent,
+    scope    = impl_scope,
+    policies = { no_git, no_mod },
+    rules    = { dev_rules }
 })
 
 task("implement", {
-
     step("apply-fix", {
-        think("medium"),
-        artifacts("fix-plan.md"), -- load the plan into context
-        reason("Implement the fixes from the plan. Follow it precisely."),
-        all_capabilities(),       -- full access to scope capabilities
         depends_on("review-plan"),
+        artifacts("fix-plan.md"), -- reference: load plan into context
+        reason("Implement the fixes from the plan. Follow it precisely."),
+        all_capabilities(),
         guard("important"),
         export()
     }),
 
     step("run-tests-after", {
+        depends_on("apply-fix"),
         execute("go test ./... 2>&1"),
         execute("go vet ./... 2>&1"),
-        depends_on("apply-fix"),
         export()
     }),
 
     step("build-check", {
-        execute("go build ./... 2>&1"),
         depends_on("run-tests-after"),
+        execute("go build ./... 2>&1"),
         export()
     })
-
 })
 
--- ── Task 4: Verify ─────────────────────────────────────────────────────────
+-- ── Task 4: Verify (fresh context — agent can't hide problems) ─────────────
 
--- Fresh context: verify agent has no memory of implementation
--- It can't hide problems it introduced
 clean("ignore_artifacts", {
     new_session  = true,
     session_name = "verify"
 })
 
 local verify_scope = scope("verify", {
-    include = {
-        all_files
-    },
-    exclude = {
-        gitignored
-    },
+    include      = { all_files },
+    exclude      = { gitignored },
     capabilities = {
         "filesystem.read",
         "filesystem.glob",
@@ -218,7 +177,6 @@ use({
 })
 
 task("verify", {
-
     step("test", {
         execute("go test ./... 2>&1"),
         execute("go vet ./... 2>&1"),
@@ -226,27 +184,23 @@ task("verify", {
     }),
 
     step("analyse-results", {
-        think("medium"),
-        artifacts("fix-plan.md"), -- check against original plan
-        reason(
-            "Review the test results. " ..
-            "Did all previously failing tests pass? " ..
-            "Were any new failures introduced? " ..
-            "Did the implementation follow the plan?"
-        ),
-        read("**/*.go"),
         depends_on("test"),
+        artifacts("fix-plan.md"), -- reference: check against original plan
+        think("medium"),
+        reason("Did all failing tests pass? Were new failures introduced? Did implementation follow the plan?"),
+        read("**/*.go"),
+        write(artifacts),
         artifacts("verification.md"),
         export()
     }),
 
     step("final-review", {
-        review(), -- present results for manual approval
+        depends_on("analyse-results"),
         artifacts("verification.md"),
+        review(),
         guard("low")
     })
-
 })
 
-finish() -- show summary, discipline agent report, any notifications
-clear()  -- clean task residue (not artifacts, checkpoints, worktrees)
+finish()
+clear()
