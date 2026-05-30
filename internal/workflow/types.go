@@ -42,9 +42,9 @@ func (s *Scope) AllowsCapability(cap string) bool {
 type PolicyKind string
 
 const (
-	PolicyDeny  PolicyKind = "deny"  // block matching patterns
-	PolicyAllow PolicyKind = "allow" // only allow matching patterns
-	PolicyLimit PolicyKind = "limit" // restrict to matching patterns
+	PolicyDeny  PolicyKind = "deny"
+	PolicyAllow PolicyKind = "allow"
+	PolicyLimit PolicyKind = "limit"
 )
 
 // Policy is a declarative capability restriction rule.
@@ -58,7 +58,7 @@ type Policy struct {
 // ── Rule ───────────────────────────────────────────────────────────────────
 
 // Rule is a behavioral constraint on the agent.
-// Rules shape how the agent reasons and acts — not just what it can execute.
+// Rules shape how the agent reasons — not just what it can execute.
 type Rule struct {
 	Name        string
 	Constraints []string
@@ -89,6 +89,8 @@ const (
 )
 
 // ScriptDef is a named hook script registered in the DSL.
+// Scripts are files — never anonymous inline code.
+// They run outside the agent context, executed by the runtime.
 type ScriptDef struct {
 	Name    string
 	Source  string        // path to .lua file (or future: mushmellow workflow)
@@ -102,9 +104,9 @@ type ScriptDef struct {
 type GuardLevel string
 
 const (
-	GuardLow      GuardLevel = "low"      // allow/deny menu
+	GuardLow       GuardLevel = "low"       // allow/deny menu
 	GuardImportant GuardLevel = "important" // rule enforcement + TouchID/password
-	GuardCritical GuardLevel = "critical"  // discipline agent + TouchID + notification + trace
+	GuardCritical  GuardLevel = "critical"  // discipline agent + TouchID + notification + trace
 )
 
 // ── Environment ────────────────────────────────────────────────────────────
@@ -119,55 +121,74 @@ type UseConfig struct {
 
 // ── Step ───────────────────────────────────────────────────────────────────
 
-// StepKind classifies what a step does.
+// StepKind classifies the primary operation of a step.
 type StepKind string
 
 const (
-	StepReason StepKind = "reason" // free-form reasoning, output → context
-	StepPlan   StepKind = "plan"   // structured reasoning, output → artifact
+	// StepReason: agent reasons with a prompt. Output → context.
+	// The agent can write if write() is declared in the step's CapCalls.
+	// reason() is the primary interface to the agent.
+	StepReason StepKind = "reason"
+
+	// StepPlan: agent produces a structured plan. Output → artifact.
+	// Always runs at high thinking level. think() has no effect inside plan steps.
+	// Guard level escalates automatically.
+	StepPlan StepKind = "plan"
 )
 
 // CapCall is a capability invocation declared inside a step.
+// Only capabilities declared in CapCalls are accessible — even if in scope.
 type CapCall struct {
-	Name    string   // capability name e.g. "filesystem.read"
-	Args    []string // explicit args (empty = open, policy-filtered)
-	All     bool     // all_capabilities() — full scope access
-	Custom  bool     // capability("name") — user-defined
+	Name   string   // capability name e.g. "filesystem.read"
+	Args   []string // explicit args (empty = open, policy-filtered)
+	All    bool     // all_capabilities() — full scope access
+	Custom bool     // capability("name") — user-defined
 }
 
-// ArtifactRef is an artifact reference or creation declaration inside a step.
+// ArtifactRef is an artifact operation inside a step.
+// Create=false: reference — load into agent context (before reasoning).
+// Create=true:  create   — write output as a named artifact (after write/plan).
 type ArtifactRef struct {
 	Name   string
-	Create bool // true = create after write, false = reference before reasoning
+	Create bool
 }
 
 // Step is a single configured execution unit inside a task.
-// Fields reflect declaration order convention:
 //
-//	depends_on → artifacts(ref) → think → reason/plan →
-//	capabilities → export → artifacts(create) → guard → review
+// Convention (not enforced, but correct):
+//
+//	depends_on()     — first: import context + enforce DAG
+//	artifacts(ref)   — before reasoning: load artifact into context
+//	think()          — set thinking mode (no effect on plan steps)
+//	reason()/plan()  — reasoning with prompt
+//	read()/write()/execute()/glob()/...  — capability access
+//	export()         — mark context for downstream steps
+//	artifacts(create) — after write/plan: save as named artifact
+//	guard()          — guard level for this step
+//	review()         — pause for manual approval
 type Step struct {
 	Name string
-	Kind StepKind // reason | plan (empty = capability-only step)
+	Kind StepKind // reason | plan | "" (capability-only step)
 
 	// Context flow
 	DependsOn []string // step names — enforces DAG + imports exported context
 	Export    bool     // make this step's context available downstream
+	          //         Requires memory() to be initialized for cross-task sharing.
 
 	// Reasoning
 	Prompt     string
-	ThinkLevel string // overrides agent default for this step
+	ThinkLevel string // overrides agent default (no effect on plan steps)
 
-	// Capability access
+	// Capability access — step only has access to what's declared here
 	CapCalls []CapCall
 
-	// Artifacts
-	ArtifactRefs []ArtifactRef // in-order: refs before reasoning, creates after
+	// Artifacts — ordered: refs before reasoning, creates after
+	ArtifactRefs []ArtifactRef
 
 	// Guard + review
-	Guard      GuardLevel
-	Review     bool   // pause for manual approval
-	ReviewAgent string // named agent to review before approval
+	Guard       GuardLevel
+	Review      bool
+	ReviewAgent string
 
 	// Failure handling
 	Retry     int
@@ -185,10 +206,12 @@ const (
 // ── Task ───────────────────────────────────────────────────────────────────
 
 // Task is the primary execution unit in Loom.
-// A task runs with a specific UseConfig (agent, scope, policies, rules).
+// Each task gets its own agent instance, locked to its use() config.
+// Tasks do not share agent history — context flows only via export()/depends_on()
+// and memory() when initialized.
 type Task struct {
-	Name string
-	Use  *UseConfig
+	Name  string
+	Use   *UseConfig
 	Steps []*Step
 }
 
@@ -198,25 +221,53 @@ type Task struct {
 type CheckpointType string
 
 const (
-	CheckpointWorktree CheckpointType = "worktree" // copy project to .loom/worktrees/
-	CheckpointState    CheckpointType = "state"    // snapshot runtime state only
+	// CheckpointWorktree copies the project to .loom/worktrees/<label>/.
+	// Both workspace() and checkpoint() can create worktrees.
+	// Checkpoint is the best place when you need a snapshot before a risky task.
+	CheckpointWorktree CheckpointType = "worktree"
+
+	// CheckpointState snapshots runtime state only (no file copy).
+	CheckpointState CheckpointType = "state"
 )
 
-// CheckpointDef is a checkpoint declaration between tasks.
+// CheckpointDef is a checkpoint declaration in the sequence.
+// Checkpoint marks a point in execution where:
+//   - state is snapped
+//   - worktree may be created
+//   - developer can review an artifact
+//   - scripts/commands can run
+//   - execution can be rolled back to
 type CheckpointDef struct {
 	Label      string
 	Type       CheckpointType
-	ReviewFile string // artifact path to present for review (empty = no review gate)
+	ReviewFile string // artifact path to present (empty = no review gate)
 }
 
 // ── Memory ─────────────────────────────────────────────────────────────────
 
 // MemoryConfig is the memory initialization config from memory() in the DSL.
+// memory() must be initialized for export() to share context across tasks.
 type MemoryConfig struct {
 	Persist  bool
-	Location string // "local" | "global"
+	Location string // "local" (.loom/memory) | "global" (~/.loom/memory)
 	Compress bool
 }
+
+// ── Runtime layers ─────────────────────────────────────────────────────────
+
+// Loom has three runtime scopes:
+//
+//	Global  (~/.loom/)       — across projects, no project required.
+//	                           Workflows run here before loom init.
+//	                           On init, global state transfers to project.
+//	Project (./.loom/)       — across workflows/entire project lifetime.
+//	                           Cleared only manually.
+//	Session (per workflow)   — across tasks in one workflow run.
+//	                           Cleared by clean().
+//
+// clear() cleans task residue only (not checkpoints, artifacts, worktrees).
+// clean() resets the session (optionally starting a new named one).
+// Global workflows run without a project; when you init loom, threads transfer.
 
 // ── Results ────────────────────────────────────────────────────────────────
 
@@ -256,21 +307,16 @@ type RunResult struct {
 // File is the parsed result of a Loom workflow file.
 // The file IS the workflow — no wrapper.
 type File struct {
-	// Defined agents, scopes, policies, rules (available for use())
-	Agents    map[string]*AgentDef
-	Scopes    map[string]*Scope
-	Policies  map[string]*Policy
-	Rules     map[string]*Rule
+	Agents     map[string]*AgentDef
+	Scopes     map[string]*Scope
+	Policies   map[string]*Policy
+	Rules      map[string]*Rule
 	Workspaces map[string]*WorkspaceDef
-	Scripts   []*ScriptDef
+	Scripts    []*ScriptDef
+	Memory     *MemoryConfig
+	Use        *UseConfig // active use() config — last call wins
 
-	// Memory config (from memory() call)
-	Memory *MemoryConfig
-
-	// Active use config (from use() call — last call wins)
-	Use *UseConfig
-
-	// Ordered execution sequence: tasks interleaved with checkpoints
+	// Ordered execution sequence.
 	Sequence []SequenceItem
 }
 
@@ -294,8 +340,9 @@ type SequenceItem struct {
 }
 
 // CleanConfig is the config from clean() in the DSL.
+// Ignore options: "ignore_memory", "ignore_artifacts", "ignore_worktrees"
 type CleanConfig struct {
-	Ignore     []string // "ignore_memory" | "ignore_artifacts" | "ignore_worktrees"
-	NewSession bool
+	Ignore      []string
+	NewSession  bool
 	SessionName string
 }
