@@ -29,38 +29,38 @@ use({
 
 task("review", {
 
-    step("read-code",
+    step("read-code", {
         glob("**/*.go"),
         read(),
         export()
-    ),
+    }),
 
     -- Three independent review tasks — same graph depth, run in parallel.
-    step("security",
+    step("security", {
         depends_on("read-code"),
         reason("Review the code for security vulnerabilities and unsafe patterns."),
         export()
-    ),
+    }),
 
-    step("performance",
+    step("performance", {
         depends_on("read-code"),
         reason("Review the code for performance issues and unnecessary allocations."),
         export()
-    ),
+    }),
 
-    step("style",
+    step("style", {
         depends_on("read-code"),
         reason("Review the code for Go idioms, naming conventions, and documentation."),
         export()
-    ),
+    }),
 
     -- Synthesize after all three complete.
-    step("synthesize",
+    step("synthesize", {
         depends_on("security", "performance", "style"),
         reason("Synthesize all findings into a prioritized report: critical, major, minor."),
         write(artifacts), -- the policy won't block this, because you are writing to artifacts, which is needed
         artifacts("review-report.md")
-    )
+    })
 
 })
 

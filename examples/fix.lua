@@ -92,19 +92,19 @@ use("defaults", {
 
 task("analyse", {
 
-    step("run-tests",
+    step("run-tests", {
         execute("go test ./... 2>&1"),
         export()
-    ),
+    }),
 
-    step("read-source",
+    step("read-source", {
         glob("**/*.go"),
         read(),
         depends_on("run-tests"),
         export()
-    ),
+    }),
 
-    step("analyse-failures",
+    step("analyse-failures", {
         think("medium"),
         reason(
             "Analyse the test output and source code. " ..
@@ -114,7 +114,7 @@ task("analyse", {
         read(),
         depends_on("read-source"),
         export()
-    )
+    })
 
 })
 
@@ -127,7 +127,7 @@ use({
 
 task("plan", {
 
-    step("create-plan",
+    step("create-plan", {
         think("high"),
         plan(
             "Based on the analysis, create a precise implementation plan. " ..
@@ -138,14 +138,14 @@ task("plan", {
         depends_on("analyse-failures"),
         artifacts("fix-plan.md"),
         export()
-    ),
+    }),
 
-    step("review-plan",
+    step("review-plan", {
         review("reviewer"),       -- reviewer agent critiques the plan
         artifacts("fix-plan.md"), -- reference the plan
         guard("important"),       -- password/touchid before continuing
         export()
-    )
+    })
 
 })
 
@@ -163,7 +163,7 @@ use({
 
 task("implement", {
 
-    step("apply-fix",
+    step("apply-fix", {
         think("medium"),
         artifacts("fix-plan.md"), -- load the plan into context
         reason("Implement the fixes from the plan. Follow it precisely."),
@@ -171,20 +171,20 @@ task("implement", {
         depends_on("review-plan"),
         guard("important"),
         export()
-    ),
+    }),
 
-    step("run-tests-after",
+    step("run-tests-after", {
         execute("go test ./... 2>&1"),
         execute("go vet ./... 2>&1"),
         depends_on("apply-fix"),
         export()
-    ),
+    }),
 
-    step("build-check",
+    step("build-check", {
         execute("go build ./... 2>&1"),
         depends_on("run-tests-after"),
         export()
-    )
+    })
 
 })
 
@@ -219,13 +219,13 @@ use({
 
 task("verify", {
 
-    step("test",
+    step("test", {
         execute("go test ./... 2>&1"),
         execute("go vet ./... 2>&1"),
         export()
-    ),
+    }),
 
-    step("analyse-results",
+    step("analyse-results", {
         think("medium"),
         artifacts("fix-plan.md"), -- check against original plan
         reason(
@@ -238,13 +238,13 @@ task("verify", {
         depends_on("test"),
         artifacts("verification.md"),
         export()
-    ),
+    }),
 
-    step("final-review",
+    step("final-review", {
         review(), -- present results for manual approval
         artifacts("verification.md"),
         guard("low")
-    )
+    })
 
 })
 

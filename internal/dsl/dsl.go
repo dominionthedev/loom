@@ -1,6 +1,6 @@
 // Package dsl evaluates Loom workflow files.
 // The file IS the workflow — no wrapper function.
-// All DSL primitives are registered as Lua globals.
+// Syntax: task(name, { steps }) and step(name, { ops })
 package dsl
 
 import (
@@ -48,7 +48,6 @@ func newFile() *workflow.File {
 	}
 }
 
-// register wires all DSL primitives into the Lua state.
 func register(L *lua.LState, f *workflow.File) {
 	// Built-in constants.
 	L.SetGlobal("gitignored", lua.LString("__gitignored__"))
@@ -122,9 +121,8 @@ func registerPolicy(L *lua.LState, f *workflow.File) {
 		name := L.CheckString(1)
 		tbl := L.CheckTable(2)
 
-		kindStr := strField(tbl, "kind")
 		var kind workflow.PolicyKind
-		switch kindStr {
+		switch strField(tbl, "kind") {
 		case "deny":
 			kind = workflow.PolicyDeny
 		case "allow":
@@ -198,9 +196,8 @@ func registerScript(L *lua.LState, f *workflow.File) {
 		name := L.CheckString(1)
 		tbl := L.CheckTable(2)
 
-		triggerStr := strField(tbl, "trigger")
 		var trigger workflow.ScriptTrigger
-		switch triggerStr {
+		switch strField(tbl, "trigger") {
 		case "on_failure":
 			trigger = workflow.TriggerOnFailure
 		case "after_task":
@@ -213,9 +210,8 @@ func registerScript(L *lua.LState, f *workflow.File) {
 			trigger = workflow.TriggerAfterStep
 		}
 
-		requireStr := strField(tbl, "require")
 		var guard workflow.GuardLevel
-		switch requireStr {
+		switch strField(tbl, "require") {
 		case "important":
 			guard = workflow.GuardImportant
 		case "critical":
@@ -258,13 +254,9 @@ func registerUse(L *lua.LState, f *workflow.File) {
 	L.SetGlobal("use", L.NewFunction(func(L *lua.LState) int {
 		cfg := &workflow.UseConfig{}
 
-		// use("defaults") or use("defaults", { overrides })
-		// use({ agent=..., scope=..., ... })
 		start := 1
 		if L.GetTop() >= 1 {
 			if s, ok := L.Get(1).(lua.LString); ok && string(s) == "defaults" {
-				// Load from global defaults — v0.4 config system.
-				// For now, start with empty and let overrides fill in.
 				start = 2
 			}
 		}
@@ -275,17 +267,15 @@ func registerUse(L *lua.LState, f *workflow.File) {
 			}
 		}
 
-		// use() clears previous use() selections.
+		// use() clears previous use() — does NOT clear context/state/checkpoints.
 		f.Use = cfg
 		return 0
 	}))
 }
 
-// resolveUseConfig extracts agent, scope, policies, rules from a use() table.
 func resolveUseConfig(tbl *lua.LTable, f *workflow.File) *workflow.UseConfig {
 	cfg := &workflow.UseConfig{}
 
-	// agent
 	if av := tbl.RawGetString("agent"); av != lua.LNil {
 		if at, ok := av.(*lua.LTable); ok {
 			if n := at.RawGetString("_agent_name"); n != lua.LNil {
@@ -294,7 +284,6 @@ func resolveUseConfig(tbl *lua.LTable, f *workflow.File) *workflow.UseConfig {
 		}
 	}
 
-	// scope
 	if sv := tbl.RawGetString("scope"); sv != lua.LNil {
 		if st, ok := sv.(*lua.LTable); ok {
 			if n := st.RawGetString("_scope_name"); n != lua.LNil {
@@ -303,7 +292,6 @@ func resolveUseConfig(tbl *lua.LTable, f *workflow.File) *workflow.UseConfig {
 		}
 	}
 
-	// policies
 	if pv := tbl.RawGetString("policies"); pv != lua.LNil {
 		if pt, ok := pv.(*lua.LTable); ok {
 			pt.ForEach(func(_, v lua.LValue) {
@@ -318,7 +306,6 @@ func resolveUseConfig(tbl *lua.LTable, f *workflow.File) *workflow.UseConfig {
 		}
 	}
 
-	// rules
 	if rv := tbl.RawGetString("rules"); rv != lua.LNil {
 		if rt, ok := rv.(*lua.LTable); ok {
 			rt.ForEach(func(_, v lua.LValue) {
@@ -336,25 +323,29 @@ func resolveUseConfig(tbl *lua.LTable, f *workflow.File) *workflow.UseConfig {
 	return cfg
 }
 
-// ── task() ────────────────────────────────────────────────────────────────
+// ── task(name, { step(...), step(...), ... }) ──────────────────────────────
+//
+// task and step now use TABLE syntax — not variadic.
+// task("name", { step("a", {...}), step("b", {...}) })
+// step("name", { depends_on("x"), reason("..."), execute(), export() })
 
 func registerTask(L *lua.LState, f *workflow.File) {
 	L.SetGlobal("task", L.NewFunction(func(L *lua.LState) int {
 		name := L.CheckString(1)
+		stepsTbl := L.CheckTable(2)
 
 		task := &workflow.Task{
 			Name: name,
-			Use:  f.Use, // snapshot current use() at task definition time
+			Use:  f.Use, // snapshot current use() at definition time
 		}
 
-		// Remaining args are step tables (results of step() calls).
-		for i := 2; i <= L.GetTop(); i++ {
-			if tbl, ok := L.Get(i).(*lua.LTable); ok {
+		stepsTbl.ForEach(func(_, v lua.LValue) {
+			if tbl, ok := v.(*lua.LTable); ok {
 				if s := tableToStep(tbl); s != nil {
 					task.Steps = append(task.Steps, s)
 				}
 			}
-		}
+		})
 
 		f.Sequence = append(f.Sequence, workflow.SequenceItem{
 			Kind: workflow.SeqTask,
@@ -363,19 +354,14 @@ func registerTask(L *lua.LState, f *workflow.File) {
 		return 0
 	}))
 
-	// step(name, op1, op2, ...) — each op is a result of a step primitive call.
+	// step("name", { op(), op(), ... })
 	L.SetGlobal("step", L.NewFunction(func(L *lua.LState) int {
 		name := L.CheckString(1)
+		opsTbl := L.CheckTable(2)
 
 		tbl := L.NewTable()
 		tbl.RawSetString("_step_name", lua.LString(name))
-
-		// Collect all step primitive results into an ordered list.
-		ops := L.NewTable()
-		for i := 2; i <= L.GetTop(); i++ {
-			ops.Append(L.Get(i))
-		}
-		tbl.RawSetString("_ops", ops)
+		tbl.RawSetString("_ops", opsTbl)
 
 		L.Push(tbl)
 		return 1
@@ -384,109 +370,122 @@ func registerTask(L *lua.LState, f *workflow.File) {
 	registerStepPrimitives(L)
 }
 
-// registerStepPrimitives registers all step-level operations.
+// ── Step primitives ───────────────────────────────────────────────────────
+
 func registerStepPrimitives(L *lua.LState) {
+	op := func(name string, populate func(*lua.LState, *lua.LTable)) {
+		L.SetGlobal(name, L.NewFunction(func(L *lua.LState) int {
+			tbl := L.NewTable()
+			tbl.RawSetString("_op", lua.LString(name))
+			populate(L, tbl)
+			L.Push(tbl)
+			return 1
+		}))
+	}
+
 	// think("level")
-	L.SetGlobal("think", makeOp(L, "think", func(L *lua.LState, tbl *lua.LTable) {
+	op("think", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("level", L.Get(1))
+			t.RawSetString("level", L.Get(1))
 		}
-	}))
+	})
 
 	// reason("prompt")
-	L.SetGlobal("reason", makeOp(L, "reason", func(L *lua.LState, tbl *lua.LTable) {
+	op("reason", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("prompt", L.Get(1))
+			t.RawSetString("prompt", L.Get(1))
 		}
-	}))
+	})
 
-	// plan("prompt")
-	L.SetGlobal("plan", makeOp(L, "plan", func(L *lua.LState, tbl *lua.LTable) {
+	// plan("prompt") — always high thinking, guard escalates
+	op("plan", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("prompt", L.Get(1))
+			t.RawSetString("prompt", L.Get(1))
 		}
-	}))
+	})
 
 	// read("pattern" | artifacts_constant)
-	L.SetGlobal("read", makeOp(L, "read", func(L *lua.LState, tbl *lua.LTable) {
+	op("read", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("target", L.Get(1))
+			t.RawSetString("target", L.Get(1))
 		}
-	}))
+	})
 
 	// write("pattern" | artifacts_constant)
-	L.SetGlobal("write", makeOp(L, "write", func(L *lua.LState, tbl *lua.LTable) {
+	op("write", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("target", L.Get(1))
+			t.RawSetString("target", L.Get(1))
 		}
-	}))
+	})
 
-	// execute("cmd1", "cmd2", ...) — empty = open (policy filtered)
-	L.SetGlobal("execute", makeOp(L, "execute", func(L *lua.LState, tbl *lua.LTable) {
+	// execute("cmd1", "cmd2", ...) or execute() = open
+	op("execute", func(L *lua.LState, t *lua.LTable) {
 		args := L.NewTable()
 		for i := 1; i <= L.GetTop(); i++ {
 			args.Append(L.Get(i))
 		}
-		tbl.RawSetString("args", args)
-	}))
+		t.RawSetString("args", args)
+	})
 
 	// background("cmd")
-	L.SetGlobal("background", makeOp(L, "background", func(L *lua.LState, tbl *lua.LTable) {
+	op("background", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("cmd", L.Get(1))
+			t.RawSetString("cmd", L.Get(1))
 		}
-	}))
+	})
 
 	// watch("pattern")
-	L.SetGlobal("watch", makeOp(L, "watch", func(L *lua.LState, tbl *lua.LTable) {
+	op("watch", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("pattern", L.Get(1))
+			t.RawSetString("pattern", L.Get(1))
 		}
-	}))
+	})
 
 	// glob("pattern")
-	L.SetGlobal("glob", makeOp(L, "glob", func(L *lua.LState, tbl *lua.LTable) {
+	op("glob", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("pattern", L.Get(1))
+			t.RawSetString("pattern", L.Get(1))
 		}
-	}))
+	})
 
 	// edit("file")
-	L.SetGlobal("edit", makeOp(L, "edit", func(L *lua.LState, tbl *lua.LTable) {
+	op("edit", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("file", L.Get(1))
+			t.RawSetString("file", L.Get(1))
 		}
-	}))
+	})
 
 	// all_capabilities()
-	L.SetGlobal("all_capabilities", makeOp(L, "all_capabilities", func(L *lua.LState, tbl *lua.LTable) {
-		tbl.RawSetString("all", lua.LTrue)
-	}))
+	op("all_capabilities", func(L *lua.LState, t *lua.LTable) {
+		t.RawSetString("all", lua.LTrue)
+	})
 
-	// capability("name")
-	L.SetGlobal("capability", makeOp(L, "capability", func(L *lua.LState, tbl *lua.LTable) {
+	// capability("name") — user-defined
+	op("capability", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("name", L.Get(1))
+			t.RawSetString("name", L.Get(1))
 		}
-	}))
+	})
 
 	// depends_on("step1", "step2", ...)
-	L.SetGlobal("depends_on", makeOp(L, "depends_on", func(L *lua.LState, tbl *lua.LTable) {
+	// Comes FIRST in step — imports context + enforces DAG.
+	op("depends_on", func(L *lua.LState, t *lua.LTable) {
 		deps := L.NewTable()
 		for i := 1; i <= L.GetTop(); i++ {
 			deps.Append(L.Get(i))
 		}
-		tbl.RawSetString("deps", deps)
-	}))
+		t.RawSetString("deps", deps)
+	})
 
-	// export()
-	L.SetGlobal("export", makeOp(L, "export", func(L *lua.LState, tbl *lua.LTable) {
-		tbl.RawSetString("export", lua.LTrue)
-	}))
+	// export() — make step context available downstream via depends_on.
+	// Requires memory() to be initialized for cross-task sharing.
+	op("export", func(L *lua.LState, t *lua.LTable) {
+		t.RawSetString("export", lua.LTrue)
+	})
 
-	// artifacts("name") — reference or create depending on position
+	// artifacts("name") — reference (before reasoning) or create (after write/plan).
+	// Position in the step ops list determines ref vs create.
 	L.SetGlobal("artifacts", L.NewFunction(func(L *lua.LState) int {
-		// If called with a string arg, it's a reference/create op.
 		if L.GetTop() >= 1 {
 			if s, ok := L.Get(1).(lua.LString); ok {
 				tbl := L.NewTable()
@@ -496,34 +495,23 @@ func registerStepPrimitives(L *lua.LState) {
 				return 1
 			}
 		}
-		// Called with no args — return the artifacts constant.
+		// No args — return the artifacts directory constant.
 		L.Push(lua.LString("__artifacts__"))
 		return 1
 	}))
 
 	// guard("level")
-	L.SetGlobal("guard", makeOp(L, "guard", func(L *lua.LState, tbl *lua.LTable) {
+	op("guard", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("level", L.Get(1))
+			t.RawSetString("level", L.Get(1))
 		}
-	}))
+	})
 
 	// review() or review("agent-name")
-	L.SetGlobal("review", makeOp(L, "review", func(L *lua.LState, tbl *lua.LTable) {
+	op("review", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			tbl.RawSetString("agent", L.Get(1))
+			t.RawSetString("agent", L.Get(1))
 		}
-	}))
-}
-
-// makeOp returns a function that creates a tagged op table for a step primitive.
-func makeOp(L *lua.LState, opName string, populate func(*lua.LState, *lua.LTable)) *lua.LFunction {
-	return L.NewFunction(func(L *lua.LState) int {
-		tbl := L.NewTable()
-		tbl.RawSetString("_op", lua.LString(opName))
-		populate(L, tbl)
-		L.Push(tbl)
-		return 1
 	})
 }
 
@@ -537,7 +525,7 @@ func registerCheckpoint(L *lua.LState, f *workflow.File) {
 		if L.GetTop() >= 2 {
 			if tbl, ok := L.Get(2).(*lua.LTable); ok {
 				if tv := tbl.RawGetString("type"); tv != lua.LNil {
-					if string(tv.(lua.LString)) == "__worktree__" {
+					if s, ok := tv.(lua.LString); ok && string(s) == "__worktree__" {
 						cp.Type = workflow.CheckpointWorktree
 					}
 				}
@@ -552,8 +540,6 @@ func registerCheckpoint(L *lua.LState, f *workflow.File) {
 		return 0
 	}))
 }
-
-// ── finish(), clear(), clean() ────────────────────────────────────────────
 
 func registerFinish(L *lua.LState, f *workflow.File) {
 	L.SetGlobal("finish", L.NewFunction(func(L *lua.LState) int {
@@ -572,8 +558,6 @@ func registerClear(L *lua.LState, f *workflow.File) {
 func registerClean(L *lua.LState, f *workflow.File) {
 	L.SetGlobal("clean", L.NewFunction(func(L *lua.LState) int {
 		cfg := &workflow.CleanConfig{}
-
-		// clean() or clean("ignore_*", { ... })
 		if L.GetTop() >= 1 {
 			if s, ok := L.Get(1).(lua.LString); ok {
 				cfg.Ignore = append(cfg.Ignore, string(s))
@@ -585,7 +569,6 @@ func registerClean(L *lua.LState, f *workflow.File) {
 				cfg.SessionName = strField(tbl, "session_name")
 			}
 		}
-
 		f.Sequence = append(f.Sequence, workflow.SequenceItem{
 			Kind:  workflow.SeqClean,
 			Clean: cfg,
@@ -596,7 +579,10 @@ func registerClean(L *lua.LState, f *workflow.File) {
 
 // ── tableToStep ───────────────────────────────────────────────────────────
 
-// tableToStep converts a step() table to a *workflow.Step.
+// tableToStep converts a step(name, {ops}) result to a *workflow.Step.
+// Op order in the table determines artifact ref vs create:
+// artifacts() BEFORE reason()/plan() = reference (load into context).
+// artifacts() AFTER write()/plan() = create.
 func tableToStep(tbl *lua.LTable) *workflow.Step {
 	nameVal := tbl.RawGetString("_step_name")
 	if nameVal == lua.LNil {
@@ -616,6 +602,9 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 	if !ok {
 		return step
 	}
+
+	// Track whether we've seen a write/plan — determines artifact create vs ref.
+	seenWrite := false
 
 	ops.ForEach(func(_, v lua.LValue) {
 		opTbl, ok := v.(*lua.LTable)
@@ -640,10 +629,12 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 			}
 
 		case "plan":
+			// plan() always uses high thinking — think() cannot override it.
 			step.Kind = workflow.StepPlan
 			if pv := opTbl.RawGetString("prompt"); pv != lua.LNil {
 				step.Prompt = string(pv.(lua.LString))
 			}
+			seenWrite = true // plan produces an artifact
 
 		case "read":
 			target := ""
@@ -664,6 +655,7 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 				Name: "filesystem.write",
 				Args: nonEmpty(target),
 			})
+			seenWrite = true
 
 		case "execute":
 			call := workflow.CapCall{Name: "process.execute"}
@@ -727,7 +719,12 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 			if nv := opTbl.RawGetString("name"); nv != lua.LNil {
 				name = string(nv.(lua.LString))
 			}
-			step.ArtifactRefs = append(step.ArtifactRefs, workflow.ArtifactRef{Name: name})
+			// Position determines ref vs create:
+			// Before write/plan = reference. After = create.
+			step.ArtifactRefs = append(step.ArtifactRefs, workflow.ArtifactRef{
+				Name:   name,
+				Create: seenWrite,
+			})
 
 		case "guard":
 			if lv := opTbl.RawGetString("level"); lv != lua.LNil {
@@ -755,24 +752,21 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 func strField(tbl *lua.LTable, key string) string {
-	v := tbl.RawGetString(key)
-	if s, ok := v.(lua.LString); ok {
+	if s, ok := tbl.RawGetString(key).(lua.LString); ok {
 		return string(s)
 	}
 	return ""
 }
 
 func strFieldDefault(tbl *lua.LTable, key, def string) string {
-	v := strField(tbl, key)
-	if v == "" {
-		return def
+	if v := strField(tbl, key); v != "" {
+		return v
 	}
-	return v
+	return def
 }
 
 func boolField(tbl *lua.LTable, key string) bool {
-	v := tbl.RawGetString(key)
-	if b, ok := v.(lua.LBool); ok {
+	if b, ok := tbl.RawGetString(key).(lua.LBool); ok {
 		return bool(b)
 	}
 	return false
@@ -790,9 +784,6 @@ func boolFieldDefault(tbl *lua.LTable, key string, def bool) bool {
 }
 
 func stringList(v lua.LValue) []string {
-	if v == lua.LNil {
-		return nil
-	}
 	tbl, ok := v.(*lua.LTable)
 	if !ok {
 		return nil
