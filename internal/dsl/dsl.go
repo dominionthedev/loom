@@ -50,9 +50,11 @@ func newFile() *workflow.File {
 
 func register(L *lua.LState, f *workflow.File) {
 	// Built-in constants.
+	// "artifacts" is NOT set here — registered once as a function in
+	// registerStepPrimitives to avoid being overwritten and causing
+	// write(artifacts) to receive an LFunction instead of a sentinel value.
 	L.SetGlobal("gitignored", lua.LString("__gitignored__"))
 	L.SetGlobal("all_files", lua.LString("__all_files__"))
-	L.SetGlobal("artifacts", lua.LString("__artifacts__"))
 	L.SetGlobal("worktree", lua.LString("__worktree__"))
 
 	registerAgent(L, f)
@@ -404,17 +406,29 @@ func registerStepPrimitives(L *lua.LState) {
 		}
 	})
 
-	// read("pattern" | artifacts_constant)
+	// read("pattern" | artifacts)
+	// If artifacts (an LFunction) is passed, treat as __artifacts__ sentinel.
 	op("read", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			t.RawSetString("target", L.Get(1))
+			v := L.Get(1)
+			if _, isFunc := v.(*lua.LFunction); isFunc {
+				t.RawSetString("target", lua.LString("__artifacts__"))
+			} else {
+				t.RawSetString("target", v)
+			}
 		}
 	})
 
-	// write("pattern" | artifacts_constant)
+	// write("pattern" | artifacts)
+	// If artifacts (an LFunction) is passed, treat as __artifacts__ sentinel.
 	op("write", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
-			t.RawSetString("target", L.Get(1))
+			v := L.Get(1)
+			if _, isFunc := v.(*lua.LFunction); isFunc {
+				t.RawSetString("target", lua.LString("__artifacts__"))
+			} else {
+				t.RawSetString("target", v)
+			}
 		}
 	})
 
