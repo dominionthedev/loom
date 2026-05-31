@@ -1,7 +1,7 @@
 // Package orchestrator executes Loom workflow files.
 // It drives the sequence: tasks, checkpoints, clear, clean, finish.
-// Every capability call passes through the Guard.
-// Independent steps at the same graph depth run in parallel.
+// The agent runs each step — the orchestrator does NOT dispatch capabilities.
+// It provides tools to the agent, then executes what the agent calls.
 package orchestrator
 
 import (
@@ -15,7 +15,6 @@ import (
 	"github.com/dominionthedev/loom/internal/agent"
 	"github.com/dominionthedev/loom/internal/capability"
 	"github.com/dominionthedev/loom/internal/graph"
-	"github.com/dominionthedev/loom/internal/guard"
 	"github.com/dominionthedev/loom/internal/model"
 	"github.com/dominionthedev/loom/internal/storage"
 	"github.com/dominionthedev/loom/internal/workflow"
@@ -24,29 +23,18 @@ import (
 // Orchestrator executes a workflow File.
 type Orchestrator struct {
 	caps   *capability.Registry
-	guard  *guard.Guard
 	router *model.Router
 	store  *storage.Store
 	log    *log.Logger
 }
 
 // New creates an Orchestrator.
-func New(
-	caps *capability.Registry,
-	router *model.Router,
-	store *storage.Store,
-	logger *log.Logger,
-) *Orchestrator {
-	return &Orchestrator{
-		caps:   caps,
-		guard:  guard.New(caps),
-		router: router,
-		store:  store,
-		log:    logger,
-	}
+func New(caps *capability.Registry, router *model.Router, store *storage.Store, logger *log.Logger) *Orchestrator {
+	return &Orchestrator{caps: caps, router: router, store: store, log: logger}
 }
 
 // Run executes a workflow file's sequence.
+// targetTask limits execution to one named task (empty = run all).
 func (o *Orchestrator) Run(ctx context.Context, f *workflow.File, targetTask string) *workflow.RunResult {
 	runID := fmt.Sprintf("%d", time.Now().UnixNano())
 	start := time.Now()
@@ -60,7 +48,6 @@ func (o *Orchestrator) Run(ctx context.Context, f *workflow.File, targetTask str
 		}
 
 		switch item.Kind {
-
 		case workflow.SeqTask:
 			if targetTask != "" && item.Task.Name != targetTask {
 				continue
@@ -74,18 +61,16 @@ func (o *Orchestrator) Run(ctx context.Context, f *workflow.File, targetTask str
 			}
 
 		case workflow.SeqCheckpoint:
-			if err := o.runCheckpoint(ctx, item.Checkpoint); err != nil {
+			if err := o.runCheckpoint(item.Checkpoint); err != nil {
 				result.Error = err
 				goto done
 			}
 
 		case workflow.SeqClear:
 			o.log.Info("clear")
-			// v0.1: clear is a no-op at runtime level — task residue is ephemeral.
 
 		case workflow.SeqClean:
 			o.log.Info("clean")
-			// v0.4: full session management. v0.1: no-op.
 
 		case workflow.SeqFinish:
 			o.log.Info("finish — workflow complete")
@@ -95,7 +80,6 @@ func (o *Orchestrator) Run(ctx context.Context, f *workflow.File, targetTask str
 done:
 	o.store.RecordRun(storage.RunRecord{
 		RunID:   runID,
-		File:    "",
 		Success: result.Error == nil,
 		Tasks:   len(result.Tasks),
 		Error: func() string {
@@ -128,14 +112,13 @@ func (o *Orchestrator) runTask(ctx context.Context, f *workflow.File, task *work
 
 	o.log.Info("task", "name", task.Name, "steps", len(task.Steps))
 
-	// Build execution graph.
 	g, err := graph.Build(task.Steps)
 	if err != nil {
 		result.Error = fmt.Errorf("task %s: %w", task.Name, err)
 		return result
 	}
 
-	// One agent per task.
+	// One agent per task, locked to its use() config.
 	ag := agent.New(use, o.caps, o.store, o.router)
 
 	// Accumulated context flows through steps.
@@ -159,7 +142,7 @@ func (o *Orchestrator) runTask(ctx context.Context, f *workflow.File, task *work
 
 			if sr.Output != "" {
 				ctxMu.Lock()
-				fmt.Fprintf(&stepContext, "[%s] %s\n", sr.StepName, sr.Output)
+				fmt.Fprintf(&stepContext, "%s\n", sr.Output)
 				ctxMu.Unlock()
 			}
 
@@ -181,7 +164,7 @@ func (o *Orchestrator) runTask(ctx context.Context, f *workflow.File, task *work
 	return result
 }
 
-// execLevel runs all steps in a graph level, in parallel if more than one.
+// execLevel runs all steps at one graph level, in parallel if more than one.
 func (o *Orchestrator) execLevel(
 	ctx context.Context,
 	use *workflow.UseConfig,
@@ -207,7 +190,8 @@ func (o *Orchestrator) execLevel(
 	return results
 }
 
-// execStep dispatches a single step.
+// execStep hands a step to the agent and returns the result.
+// The agent drives everything — tool selection, execution order, final output.
 func (o *Orchestrator) execStep(
 	ctx context.Context,
 	use *workflow.UseConfig,
@@ -219,9 +203,10 @@ func (o *Orchestrator) execStep(
 	o.log.Info("step", "name", step.Name, "kind", step.Kind)
 
 	// Import exported context from depends_on.
+	importedCtx := accumulatedContext
 	for _, depName := range step.DependsOn {
 		if imported := ag.ImportFrom(depName); imported != "" {
-			accumulatedContext = fmt.Sprintf("[imported from %s]\n%s\n\n%s", depName, imported, accumulatedContext)
+			importedCtx = imported + "\n" + importedCtx
 		}
 	}
 
@@ -230,131 +215,69 @@ func (o *Orchestrator) execStep(
 		if !ref.Create && ref.Name != "" {
 			content, err := o.store.ReadArtifact(ref.Name)
 			if err == nil {
-				accumulatedContext = fmt.Sprintf("[artifact: %s]\n%s\n\n%s", ref.Name, content, accumulatedContext)
+				importedCtx = fmt.Sprintf("[artifact: %s]\n%s\n\n%s", ref.Name, content, importedCtx)
 			}
 		}
 	}
 
-	var output string
-	var stepErr error
+	// Build step capability list and args from CapCalls.
+	stepCapNames, capArgs := buildCapSets(step.CapCalls, use.Scope)
 
-	// ── Reasoning ──────────────────────────────────────────────────────
-	switch step.Kind {
-	case workflow.StepReason:
-		output, stepErr = ag.Reason(ctx, step.Name, step.Prompt, step.ThinkLevel, accumulatedContext)
-		if stepErr != nil {
-			return failed(step.Name, stepErr)
-		}
-
-	case workflow.StepPlan:
-		output, stepErr = ag.Plan(ctx, step.Name, step.Prompt, accumulatedContext)
-		if stepErr != nil {
-			return failed(step.Name, stepErr)
+	// If no prompt and no caps — nothing for the agent to do.
+	if step.Kind == "" && len(stepCapNames) == 0 {
+		return &workflow.StepResult{
+			StepName: step.Name,
+			Status:   workflow.StepOK,
 		}
 	}
 
-	// ── Capability execution ────────────────────────────────────────────
-	for _, call := range step.CapCalls {
-		if call.All {
-			// all_capabilities(): run all scope capabilities that have args
-			continue
+	// Hand off to agent.
+	out, err := ag.RunStep(ctx, step, stepCapNames, capArgs, importedCtx)
+	if err != nil {
+		return &workflow.StepResult{
+			StepName: step.Name,
+			Status:   workflow.StepFailed,
+			Error:    err,
 		}
-
-		capName := call.Name
-		if capName == "" {
-			continue
-		}
-
-		// Build input from call args.
-		input := capability.Input{}
-		if len(call.Args) == 1 {
-			// Single arg: treat as cmd or path depending on capability.
-			if strings.HasPrefix(capName, "process.") {
-				input["cmd"] = call.Args[0]
-			} else {
-				input["path"] = call.Args[0]
-			}
-		} else if len(call.Args) > 1 {
-			// Multiple commands: run each.
-			for _, cmd := range call.Args {
-				cmdInput := capability.Input{"cmd": cmd}
-				if v := o.guard.Check(use.Scope, use.Policies, step.CapCalls, capName, cmdInput); v != nil {
-					o.log.Warn("guard blocked", "step", step.Name, "cap", capName, "reason", v.Message)
-					return &workflow.StepResult{
-						StepName: step.Name,
-						Status:   workflow.StepBlocked,
-						Error:    v,
-					}
-				}
-				result := o.caps.Execute(ctx, capName, cmdInput)
-				if result.Error != nil && step.OnFailure == workflow.OnFailureStop {
-					return failed(step.Name, fmt.Errorf("%s: %w", capName, result.Error))
-				}
-				output += result.Output + "\n"
-			}
-			continue
-		}
-
-		// Guard check.
-		if v := o.guard.Check(use.Scope, use.Policies, step.CapCalls, capName, input); v != nil {
-			o.log.Warn("guard blocked", "step", step.Name, "cap", capName, "reason", v.Message)
-			return &workflow.StepResult{
-				StepName: step.Name,
-				Status:   workflow.StepBlocked,
-				Error:    v,
-			}
-		}
-
-		result := o.caps.Execute(ctx, capName, input)
-		if result.Error != nil {
-			if step.OnFailure == workflow.OnFailureContinue {
-				o.log.Warn("step error (continuing)", "step", step.Name, "err", result.Error)
-				continue
-			}
-			return failed(step.Name, fmt.Errorf("%s: %w", capName, result.Error))
-		}
-		output += result.Output
 	}
 
-	// ── Export ─────────────────────────────────────────────────────────
-	if step.Export && output != "" {
-		ag.Export(step.Name, output)
+	// Export if declared.
+	if step.Export {
+		ag.Export(step.Name, out)
 	}
 
-	// ── Create artifacts ────────────────────────────────────────────────
+	// Create artifacts declared after write/plan.
 	for _, ref := range step.ArtifactRefs {
-		if ref.Create && ref.Name != "" && output != "" {
+		if ref.Create && ref.Name != "" && out.Answer != "" {
 			kind := "output"
 			if step.Kind == workflow.StepPlan {
 				kind = "plan"
 			} else if step.Kind == workflow.StepReason {
 				kind = "analysis"
 			}
-			_ = o.store.SaveArtifact("", "", step.Name, ref.Name, kind, output)
+			_ = o.store.SaveArtifact("", "", step.Name, ref.Name, kind, out.Answer)
 		}
 	}
 
 	return &workflow.StepResult{
 		StepName: step.Name,
 		Status:   workflow.StepOK,
-		Output:   output,
+		Output:   out.Answer,
 	}
 }
 
 // runCheckpoint handles a checkpoint in the sequence.
-func (o *Orchestrator) runCheckpoint(ctx context.Context, cp *workflow.CheckpointDef) error {
+func (o *Orchestrator) runCheckpoint(cp *workflow.CheckpointDef) error {
 	o.log.Info("checkpoint", "label", cp.Label, "type", cp.Type)
 
 	if cp.Type == workflow.CheckpointWorktree {
-		o.log.Info("worktree checkpoint — snapshot before continuing", "label", cp.Label)
+		o.log.Info("worktree — project snapshot before continuing", "label", cp.Label)
 		// v0.3: full worktree copy implementation.
-		// v0.1: log intent, continue.
 	}
 
 	if cp.ReviewFile != "" {
 		return o.runReviewGate(cp.ReviewFile)
 	}
-
 	return nil
 }
 
@@ -362,14 +285,11 @@ func (o *Orchestrator) runCheckpoint(ctx context.Context, cp *workflow.Checkpoin
 func (o *Orchestrator) runReviewGate(artifactPath string) error {
 	content, err := o.store.ReadArtifact(artifactPath)
 	if err != nil {
-		// Non-fatal: artifact may not exist yet.
 		o.log.Warn("review gate: artifact not found", "path", artifactPath)
 	} else {
 		fmt.Println()
-		fmt.Printf("  ── review: %s ──────────────────────────────\n", artifactPath)
-		fmt.Println()
-		lines := strings.Split(content, "\n")
-		for _, line := range lines {
+		fmt.Printf("  ── review: %s ──────────────────────────\n\n", artifactPath)
+		for _, line := range strings.Split(content, "\n") {
 			fmt.Printf("  %s\n", line)
 		}
 		fmt.Println()
@@ -378,9 +298,7 @@ func (o *Orchestrator) runReviewGate(artifactPath string) error {
 	fmt.Print("  continue? [y/n]: ")
 	var response string
 	fmt.Scanln(&response)
-	response = strings.TrimSpace(strings.ToLower(response))
-
-	if response != "y" && response != "yes" {
+	if strings.ToLower(strings.TrimSpace(response)) != "y" {
 		return fmt.Errorf("review gate: rejected at %q", artifactPath)
 	}
 	return nil
@@ -388,12 +306,55 @@ func (o *Orchestrator) runReviewGate(artifactPath string) error {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-func failed(stepName string, err error) *workflow.StepResult {
-	return &workflow.StepResult{
-		StepName: stepName,
-		Status:   workflow.StepFailed,
-		Error:    err,
+// buildCapSets builds the step's capability name list and args map from CapCalls.
+// If all_capabilities() is declared, expands to everything in scope.
+func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, map[string]map[string]string) {
+	args := make(map[string]map[string]string)
+	seen := make(map[string]bool)
+	var names []string
+
+	for _, c := range calls {
+		if c.All {
+			// all_capabilities() — use everything in scope.
+			if scope != nil {
+				for _, name := range scope.Capabilities {
+					if !seen[name] {
+						names = append(names, name)
+						seen[name] = true
+					}
+				}
+			}
+			continue
+		}
+		if c.Name == "" {
+			continue
+		}
+		if !seen[c.Name] {
+			names = append(names, c.Name)
+			seen[c.Name] = true
+		}
+		// Build args map from CapCall.Args.
+		// Single arg: interpret as the primary field (pattern, path, cmd).
+		if len(c.Args) > 0 {
+			if args[c.Name] == nil {
+				args[c.Name] = make(map[string]string)
+			}
+			switch c.Name {
+			case "filesystem.glob", "process.watch":
+				args[c.Name]["pattern"] = c.Args[0]
+			case "filesystem.read", "filesystem.write", "filesystem.edit":
+				args[c.Name]["path"] = c.Args[0]
+			case "process.execute", "process.background":
+				// Multiple args = multiple locked commands.
+				// For now, join as semicolons if multiple.
+				args[c.Name]["cmd"] = strings.Join(c.Args, " && ")
+			default:
+				args[c.Name]["value"] = c.Args[0]
+			}
+		}
 	}
+
+	return names, args
 }
 
 func findStep(steps []*workflow.Step, name string) *workflow.Step {
@@ -414,6 +375,3 @@ func countTasks(seq []workflow.SequenceItem) int {
 	}
 	return n
 }
-
-
-// Ensure os is used.
