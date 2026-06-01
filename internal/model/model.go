@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -24,15 +25,21 @@ type Model interface {
 	Chat(ctx context.Context, system string, history []Turn, input string) (string, error)
 }
 
-// Config holds model routing configuration.
-// Loaded from loom.lua config — maps think levels to model names.
-type Config struct {
-	Default string // model for think("low") or no think()
-	Medium  string // model for think("medium")
-	High    string // model for think("high")
+// ModelInfo is returned by ListModels.
+type ModelInfo struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
 }
 
-// DefaultConfig returns a config pointing everything at the same model.
+// Config holds model routing configuration.
+// Maps think levels to model names.
+type Config struct {
+	Default string // think("low") or no think()
+	Medium  string // think("medium")
+	High    string // think("high") — used by plan() always
+}
+
+// DefaultConfig points all levels at the same model.
 func DefaultConfig(modelName string) Config {
 	return Config{
 		Default: modelName,
@@ -44,7 +51,7 @@ func DefaultConfig(modelName string) Config {
 // Router selects the right model based on think level.
 type Router struct {
 	cfg     Config
-	clients map[string]Model // model name → client
+	clients map[string]Model
 	baseURL string
 }
 
@@ -54,12 +61,11 @@ func NewRouter(cfg Config) *Router {
 	if base == "" {
 		base = "http://localhost:11434"
 	}
-	r := &Router{
+	return &Router{
 		cfg:     cfg,
 		clients: make(map[string]Model),
 		baseURL: base,
 	}
-	return r
 }
 
 // For returns the model for a given think level or explicit model name.
@@ -73,10 +79,11 @@ func (r *Router) For(thinkLevel string) Model {
 	return m
 }
 
-// Default returns the default model (no think() specified).
-func (r *Router) Default() Model {
-	return r.For("")
-}
+// Default returns the default model.
+func (r *Router) Default() Model { return r.For("") }
+
+// BaseURL returns the server base URL.
+func (r *Router) BaseURL() string { return r.baseURL }
 
 func (r *Router) resolve(level string) string {
 	switch level {
@@ -93,9 +100,37 @@ func (r *Router) resolve(level string) string {
 		}
 		return r.cfg.Default
 	default:
-		// Explicit model name passed directly.
-		return level
+		return level // explicit model name
 	}
+}
+
+// ListModels queries /api/tags and returns available models.
+func ListModels(baseURL string) ([]ModelInfo, error) {
+	if baseURL == "" {
+		baseURL = firstEnv("OLLAMA_HOST", "OLLACLOUD_HOST")
+	}
+	if baseURL == "" {
+		baseURL = "http://localhost:11434"
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(baseURL + "/api/tags")
+	if err != nil {
+		return nil, fmt.Errorf("model: list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("model: list: server returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Models []ModelInfo `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("model: list: decode: %w", err)
+	}
+	return result.Models, nil
 }
 
 // ── Ollama ────────────────────────────────────────────────────────────────
@@ -110,7 +145,7 @@ func newOllama(baseURL, name string) *ollamaModel {
 	return &ollamaModel{
 		baseURL: baseURL,
 		name:    name,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		client:  &http.Client{Timeout: 180 * time.Second},
 	}
 }
 
@@ -145,19 +180,26 @@ func (m *ollamaModel) Chat(ctx context.Context, system string, history []Turn, i
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		m.baseURL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("model: %w", err)
+		return "", fmt.Errorf("model: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("model: request: %w", err)
+		return "", fmt.Errorf("model: request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// ── Non-2xx is a real error — don't silently decode garbage ──────
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("model: server returned %d for model %q: %s",
+			resp.StatusCode, m.name, strings.TrimSpace(string(errBody)))
+	}
+
 	var out ollamaResp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("model: decode: %w", err)
+		return "", fmt.Errorf("model: decode response: %w", err)
 	}
 	return strings.TrimSpace(out.Message.Content), nil
 }
