@@ -1,20 +1,13 @@
 // Package agent provides Loom's constrained reasoning layer.
 // The agent IS the execution — it reasons, calls tools, and produces output.
-// It operates inside boundaries defined by use(): scope, capabilities, rules.
-//
-// The agent loop per step:
-//
-//	Receive: prompt + context + available tools (with effective schemas)
-//	Loop:
-//	  model responds with tool call OR final answer
-//	  tool call → runtime executes → result fed back → continue
-//	  final answer → step output = answer + accumulated tool outputs
+// One agent instance per task. Parallel steps get snapshot copies of history.
 package agent
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/dominionthedev/loom/internal/capability"
 	"github.com/dominionthedev/loom/internal/model"
@@ -32,10 +25,14 @@ type ToolCall struct {
 
 // StepOutput is what a step produces after the agent loop completes.
 type StepOutput struct {
-	Answer      string            // agent's final text output
-	ToolOutputs map[string]string // tool name → last output from that tool
+	Answer      string
+	ToolOutputs map[string]string // tool name → last output
 	Context     string            // full context string for export/depends_on
 }
+
+// LogFunc is called for verbose output during execution.
+// nil = silent.
+type LogFunc func(event, detail string)
 
 // Agent is a constrained reasoning instance, one per task.
 type Agent struct {
@@ -44,6 +41,9 @@ type Agent struct {
 	caps            *capability.Registry
 	store           *storage.Store
 	router          *model.Router
+	log             LogFunc
+
+	mu              sync.RWMutex
 	history         []model.Turn
 	exportedContext map[string]string // step name → exported context
 }
@@ -54,6 +54,7 @@ func New(
 	caps *capability.Registry,
 	store *storage.Store,
 	router *model.Router,
+	logFn LogFunc,
 ) *Agent {
 	def := use.Agent
 	if def == nil {
@@ -65,14 +66,13 @@ func New(
 		caps:            caps,
 		store:           store,
 		router:          router,
+		log:             logFn,
 		exportedContext: make(map[string]string),
 	}
 }
 
 // RunStep executes a step's agent loop.
-// stepCaps is the list of capabilities available in this step (from CapCalls).
-// capArgs is a map of capName → static args from the Lua file.
-// accumulatedContext is the context from prior steps.
+// For parallel steps, a snapshot of history is used — thread-safe.
 func (a *Agent) RunStep(
 	ctx context.Context,
 	step *workflow.Step,
@@ -82,7 +82,6 @@ func (a *Agent) RunStep(
 ) (*StepOutput, error) {
 
 	m := a.modelForLevel(step.ThinkLevel)
-	// plan() always uses high — override.
 	if step.Kind == workflow.StepPlan {
 		m = a.router.For("high")
 	}
@@ -90,45 +89,58 @@ func (a *Agent) RunStep(
 	system := a.buildSystem(step, stepCapNames, capArgs)
 	toolOutputs := make(map[string]string)
 
-	// Build initial user message from prompt + context.
-	userMsg := a.buildUserMessage(step, accumulatedContext)
-
-	// Seed the per-step conversation.
+	// Snapshot history for this step — safe for parallel execution.
+	a.mu.RLock()
 	stepHistory := make([]model.Turn, len(a.history))
 	copy(stepHistory, a.history)
+	a.mu.RUnlock()
+
+	userMsg := a.buildUserMessage(step, accumulatedContext)
 
 	for i := 0; i < maxToolCallIterations; i++ {
-		reply, err := m.Chat(ctx, system, stepHistory, userMsg)
-		if err != nil {
-			return nil, fmt.Errorf("agent: step %q iter %d: %w", step.Name, i, err)
+		if a.log != nil {
+			a.log("agent:thinking", fmt.Sprintf("step=%s iter=%d", step.Name, i+1))
 		}
 
-		// Append this exchange to step history.
+		reply, err := m.Chat(ctx, system, stepHistory, userMsg)
+		if err != nil {
+			return nil, fmt.Errorf("agent: step %q: %w", step.Name, err)
+		}
+
+		if a.log != nil {
+			a.log("agent:reply", truncate(reply, 200))
+		}
+
 		stepHistory = append(stepHistory,
 			model.Turn{Role: "user", Content: userMsg},
 			model.Turn{Role: "assistant", Content: reply},
 		)
 
-		// Check if this is a tool call.
 		tc := parseToolCall(reply)
 		if tc == nil {
-			// Final answer — done.
+			// Final answer.
 			out := &StepOutput{
 				Answer:      reply,
 				ToolOutputs: toolOutputs,
 			}
 			out.Context = buildContextString(step.Name, reply, toolOutputs, accumulatedContext)
 
-			// Persist step history to agent history for cross-step continuity.
+			// Merge step history back into agent history (under lock).
+			a.mu.Lock()
 			a.history = stepHistory
+			a.mu.Unlock()
+
 			return out, nil
 		}
 
-		// Execute the tool call.
+		// Execute the tool.
 		toolResult := a.executeTool(ctx, tc, capArgs, stepCapNames)
 		toolOutputs[tc.Tool] = toolResult
 
-		// Feed result back as next user message.
+		if a.log != nil {
+			a.log("tool:result", fmt.Sprintf("%s → %s", tc.Tool, truncate(toolResult, 200)))
+		}
+
 		userMsg = fmt.Sprintf("Tool result for %s:\n%s\n\nContinue.", tc.Tool, toolResult)
 	}
 
@@ -136,8 +148,7 @@ func (a *Agent) RunStep(
 }
 
 // executeTool runs a tool call from the agent.
-// Merges static args (from Lua) with agent-provided input.
-// Static args always win — they cannot be overridden by the agent.
+// Static args always override agent-provided input.
 func (a *Agent) executeTool(
 	ctx context.Context,
 	tc *ToolCall,
@@ -156,9 +167,12 @@ func (a *Agent) executeTool(
 		return fmt.Sprintf("error: tool %q not available in this step", tc.Tool)
 	}
 
-	// Merge: static args override agent input.
 	staticArgs := capability.Input(capArgs[tc.Tool])
 	merged := staticArgs.Merge(tc.Input)
+
+	if a.log != nil {
+		a.log("tool:call", fmt.Sprintf("%s %v", tc.Tool, merged))
+	}
 
 	result := a.caps.Execute(ctx, tc.Tool, merged)
 	if result.Error != nil {
@@ -167,14 +181,17 @@ func (a *Agent) executeTool(
 	return result.Output
 }
 
-// Export marks a step's context as available for downstream depends_on imports.
-// Requires memory() to be initialized for cross-task persistence.
+// Export marks a step's full context as available downstream.
 func (a *Agent) Export(stepName string, out *StepOutput) {
+	a.mu.Lock()
 	a.exportedContext[stepName] = out.Context
+	a.mu.Unlock()
 }
 
-// ImportFrom returns the exported context from a prior step.
+// ImportFrom returns exported context from a prior step.
 func (a *Agent) ImportFrom(stepName string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.exportedContext[stepName]
 }
 
@@ -194,7 +211,6 @@ func (a *Agent) buildSystem(
 		sb.WriteString("\n\n")
 	}
 
-	// Scope boundaries.
 	if a.use.Scope != nil {
 		sb.WriteString(fmt.Sprintf("Scope: %s\n", a.use.Scope.Name))
 		if len(a.use.Scope.Include) > 0 {
@@ -206,7 +222,6 @@ func (a *Agent) buildSystem(
 		sb.WriteString("\n")
 	}
 
-	// Rules.
 	if len(a.use.Rules) > 0 {
 		sb.WriteString("Rules — you must follow these:\n")
 		for _, r := range a.use.Rules {
@@ -217,31 +232,30 @@ func (a *Agent) buildSystem(
 		sb.WriteString("\n")
 	}
 
-	// Available tools with effective schemas.
 	if len(stepCapNames) > 0 {
 		sb.WriteString("Available tools:\n")
 		sb.WriteString(a.caps.DescribeForAgent(stepCapNames, capArgs))
 		sb.WriteString("\n")
 	}
 
-	// Tool call format.
 	sb.WriteString(`When you need to use a tool, respond with EXACTLY this format and nothing else:
 TOOL: tool_name
 INPUT: key1=value1 key2=value2
 
-For multi-line values use key=<<<
-value here
+For multi-line content use:
+TOOL: tool_name
+INPUT: key=<<<
+content here
 >>>
 
-When you are finished and have your final answer, respond with plain text only (no TOOL: prefix).
-Do not explain your tool calls — just make them. Be precise.
+When finished, respond with plain text only (no TOOL: prefix).
+Do not explain tool calls. Be precise and minimal.
 `)
 
-	// Mode-specific.
 	switch step.Kind {
 	case workflow.StepPlan:
 		sb.WriteString("\nYou are producing a structured implementation plan.\n")
-		sb.WriteString("Format: numbered steps, file paths, exact changes. Be specific.\n")
+		sb.WriteString("Format: numbered steps, file paths, exact changes. No vagueness.\n")
 	case workflow.StepReason:
 		sb.WriteString("\nReason precisely. Do not hallucinate file contents or tool outputs.\n")
 	}
@@ -251,19 +265,16 @@ Do not explain your tool calls — just make them. Be precise.
 
 func (a *Agent) buildUserMessage(step *workflow.Step, accumulatedContext string) string {
 	var sb strings.Builder
-
 	if accumulatedContext != "" {
 		sb.WriteString("Context from previous steps:\n")
 		sb.WriteString(accumulatedContext)
 		sb.WriteString("\n\n")
 	}
-
 	if step.Prompt != "" {
 		sb.WriteString(step.Prompt)
 	} else {
-		sb.WriteString("Execute this step using the available tools.")
+		sb.WriteString("Complete this step using the available tools.")
 	}
-
 	return sb.String()
 }
 
@@ -274,56 +285,62 @@ func (a *Agent) modelForLevel(level string) model.Model {
 	return a.router.For(level)
 }
 
-// buildContextString assembles the full context for export().
 func buildContextString(stepName, answer string, toolOutputs map[string]string, priorContext string) string {
 	var sb strings.Builder
 	if priorContext != "" {
 		sb.WriteString(priorContext)
 		sb.WriteString("\n")
 	}
-	if len(toolOutputs) > 0 {
-		for tool, out := range toolOutputs {
-			sb.WriteString(fmt.Sprintf("[%s → %s]\n%s\n", stepName, tool, truncate(out, 2000)))
-		}
+	for tool, out := range toolOutputs {
+		sb.WriteString(fmt.Sprintf("[%s → %s]\n%s\n", stepName, tool, truncate(out, 2000)))
 	}
 	if answer != "" {
-		sb.WriteString(fmt.Sprintf("[%s reasoning]\n%s\n", stepName, answer))
+		sb.WriteString(fmt.Sprintf("[%s]\n%s\n", stepName, answer))
 	}
 	return sb.String()
 }
 
 // ── Tool call parsing ──────────────────────────────────────────────────────
 
-// parseToolCall attempts to parse a model response as a tool call.
-// Returns nil if the response is a final answer (no TOOL: prefix).
 func parseToolCall(response string) *ToolCall {
 	response = strings.TrimSpace(response)
 	if !strings.HasPrefix(response, "TOOL:") {
 		return nil
 	}
 
-	lines := strings.Split(response, "\n")
 	tc := &ToolCall{Input: make(capability.Input)}
+	lines := strings.Split(response, "\n")
+	inMultiline := false
+	var mlKey, mlVal strings.Builder
 
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
+	for _, line := range lines {
 		if strings.HasPrefix(line, "TOOL:") {
 			tc.Tool = strings.TrimSpace(strings.TrimPrefix(line, "TOOL:"))
 			continue
 		}
 		if strings.HasPrefix(line, "INPUT:") {
-			inputStr := strings.TrimSpace(strings.TrimPrefix(line, "INPUT:"))
-			parseInputLine(inputStr, tc.Input)
-
-			// Handle multi-line values with <<<...>>>
-			for j := i + 1; j < len(lines); j++ {
-				rest := strings.TrimSpace(lines[j])
-				if rest == "" {
-					continue
-				}
-				parseInputLine(rest, tc.Input)
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "INPUT:"))
+			if rest != "" {
+				parseKV(rest, tc.Input, &inMultiline, &mlKey, &mlVal)
 			}
-			break
+			continue
+		}
+		if inMultiline {
+			if strings.TrimSpace(line) == ">>>" {
+				tc.Input[mlKey.String()] = strings.TrimSpace(mlVal.String())
+				mlKey.Reset()
+				mlVal.Reset()
+				inMultiline = false
+			} else {
+				mlVal.WriteString(line)
+				mlVal.WriteString("\n")
+			}
+			continue
+		}
+		// Continuation key=value lines after INPUT:
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && strings.Contains(trimmed, "=") {
+			parseKV(trimmed, tc.Input, &inMultiline, &mlKey, &mlVal)
 		}
 	}
 
@@ -333,9 +350,7 @@ func parseToolCall(response string) *ToolCall {
 	return tc
 }
 
-// parseInputLine parses "key=value" or "key=<<<" multi-line markers.
-func parseInputLine(line string, input capability.Input) {
-	// Handle key=<<<multi-line>>> patterns by extracting inline content.
+func parseKV(line string, input capability.Input, inML *bool, mlKey, mlVal *strings.Builder) {
 	eqIdx := strings.Index(line, "=")
 	if eqIdx < 0 {
 		return
@@ -343,11 +358,17 @@ func parseInputLine(line string, input capability.Input) {
 	key := strings.TrimSpace(line[:eqIdx])
 	val := strings.TrimSpace(line[eqIdx+1:])
 
-	// Strip <<< >>> markers if present.
+	if strings.HasSuffix(val, "<<<") || val == "<<<" {
+		mlKey.Reset()
+		mlKey.WriteString(key)
+		mlVal.Reset()
+		*inML = true
+		return
+	}
+
 	val = strings.TrimPrefix(val, "<<<")
 	val = strings.TrimSuffix(val, ">>>")
 	val = strings.TrimSpace(val)
-
 	if key != "" {
 		input[key] = val
 	}
