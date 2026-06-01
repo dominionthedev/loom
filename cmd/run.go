@@ -23,7 +23,8 @@ var runCmd = &cobra.Command{
 
   loom run fix.lua
   loom run fix.lua --task verify
-  loom run fix.lua --dry-run`,
+  loom run fix.lua --dry-run
+  loom run fix.lua -v              # verbose: show tool calls + model replies`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		filePath := args[0]
@@ -33,15 +34,14 @@ var runCmd = &cobra.Command{
 		// ── Load DSL ─────────────────────────────────────────────────
 		f, err := dsl.Eval(filePath)
 		if err != nil {
-			return fmt.Errorf("%w", err)
+			return err
 		}
 		if len(f.Sequence) == 0 {
 			return fmt.Errorf("no tasks found in %s", filePath)
 		}
 
-		// ── Dry run — just inspect ────────────────────────────────────
 		if dryRun {
-			return runDryRun(f)
+			return runDryRun(f, targetTask)
 		}
 
 		// ── Runtime setup ─────────────────────────────────────────────
@@ -57,11 +57,19 @@ var runCmd = &cobra.Command{
 
 		caps := capability.New()
 
-		modelCfg := model.DefaultConfig(flagModel)
+		modelCfg := model.Config{
+			Default: flagModel,
+			Medium:  flagModelMid,
+			High:    flagModelHigh,
+		}
 		router := model.NewRouter(modelCfg)
 
 		logger := log.New(os.Stderr)
-		orch := orchestrator.New(caps, router, store, logger)
+		if flagVerbose {
+			logger.SetLevel(log.DebugLevel)
+		}
+
+		orch := orchestrator.New(caps, router, store, logger, flagVerbose)
 
 		// ── Execute ───────────────────────────────────────────────────
 		fmt.Fprintln(os.Stderr)
@@ -72,7 +80,7 @@ var runCmd = &cobra.Command{
 		for _, tr := range result.Tasks {
 			fmt.Printf("  task: %s\n", tr.TaskName)
 			for _, sr := range tr.Steps {
-				printStep(sr)
+				printStepResult(sr)
 			}
 		}
 		fmt.Println()
@@ -87,7 +95,7 @@ var runCmd = &cobra.Command{
 	},
 }
 
-func printStep(sr *workflow.StepResult) {
+func printStepResult(sr *workflow.StepResult) {
 	switch sr.Status {
 	case workflow.StepOK:
 		fmt.Printf("    ✓  %s\n", sr.StepName)
@@ -116,28 +124,31 @@ func printStep(sr *workflow.StepResult) {
 			}
 		}
 	case workflow.StepBlocked:
-		fmt.Printf("    ⊘  %s (blocked by guard)\n", sr.StepName)
+		fmt.Printf("    ⊘  %s (guard blocked)\n", sr.StepName)
 		if sr.Error != nil {
 			fmt.Printf("       %s\n", sr.Error.Error())
 		}
 	case workflow.StepSkipped:
-		fmt.Printf("    –  %s (skipped)\n", sr.StepName)
+		fmt.Printf("    –  %s\n", sr.StepName)
 	}
 }
 
-func runDryRun(f *workflow.File) error {
+func runDryRun(f *workflow.File, targetTask string) error {
 	fmt.Println("dry run — no execution")
 	fmt.Println()
 	for _, item := range f.Sequence {
 		switch item.Kind {
 		case workflow.SeqTask:
+			if targetTask != "" && item.Task.Name != targetTask {
+				continue
+			}
 			fmt.Printf("  task: %s (%d steps)\n", item.Task.Name, len(item.Task.Steps))
 			for _, s := range item.Task.Steps {
-				fmt.Printf("    step: %s [%s]", s.Name, s.Kind)
+				deps := ""
 				if len(s.DependsOn) > 0 {
-					fmt.Printf(" → depends_on: %s", strings.Join(s.DependsOn, ", "))
+					deps = fmt.Sprintf(" → after: %s", strings.Join(s.DependsOn, ", "))
 				}
-				fmt.Println()
+				fmt.Printf("    %s [%s]%s\n", s.Name, s.Kind, deps)
 			}
 		case workflow.SeqCheckpoint:
 			fmt.Printf("  checkpoint: %s (%s)\n", item.Checkpoint.Label, item.Checkpoint.Type)
