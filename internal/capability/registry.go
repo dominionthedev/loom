@@ -356,7 +356,18 @@ func (p *procExecute) Execute(ctx context.Context, input Input) Result {
 		return Result{Error: fmt.Errorf("process.execute: missing 'cmd'")}
 	}
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
-	return Result{Output: string(out), Error: err}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// The command RAN — it just exited non-zero. That's information
+			// the agent/workflow should reason about (e.g. failing tests),
+			// not an infrastructure error. Don't fail the step over this.
+			return Result{Output: fmt.Sprintf("%s\n[exit code: %d]", string(out), exitErr.ExitCode())}
+		}
+		// Could not execute at all — shell missing, context cancelled, etc.
+		// This IS a real capability failure.
+		return Result{Error: fmt.Errorf("process.execute: %w", err)}
+	}
+	return Result{Output: string(out)}
 }
 
 // ── process.background ────────────────────────────────────────────────────
