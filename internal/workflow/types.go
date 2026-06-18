@@ -289,11 +289,23 @@ type StepResult struct {
 	Error    error
 }
 
+// DeniedCapability records a capability the agent attempted but couldn't
+// access — either undeclared in scope/step, or blocked by Guard (path,
+// command-path heuristic, or policy). Surfaced as a non-blocking, end-of-run
+// report so a developer can catch a missing declaration that wasn't
+// intentional, rather than the agent silently working around it.
+type DeniedCapability struct {
+	Step   string
+	Tool   string
+	Reason string
+}
+
 // TaskResult captures the outcome of one task.
 type TaskResult struct {
 	TaskName string
 	Steps    []*StepResult
 	Error    error
+	Denied   []DeniedCapability
 }
 
 // RunResult is the full outcome of a file execution.
