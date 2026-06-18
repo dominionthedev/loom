@@ -14,6 +14,7 @@ import (
 	"github.com/dominionthedev/loom/internal/agent"
 	"github.com/dominionthedev/loom/internal/capability"
 	"github.com/dominionthedev/loom/internal/graph"
+	"github.com/dominionthedev/loom/internal/guard"
 	"github.com/dominionthedev/loom/internal/model"
 	"github.com/dominionthedev/loom/internal/storage"
 	"github.com/dominionthedev/loom/internal/workflow"
@@ -26,6 +27,7 @@ type Orchestrator struct {
 	store   *storage.Store
 	log     *log.Logger
 	verbose bool
+	grd     *guard.Guard
 }
 
 // New creates an Orchestrator.
@@ -36,6 +38,7 @@ func New(caps *capability.Registry, router *model.Router, store *storage.Store, 
 		store:   store,
 		log:     logger,
 		verbose: verbose,
+		grd:     guard.New(caps),
 	}
 }
 
@@ -158,7 +161,7 @@ func (o *Orchestrator) runTask(ctx context.Context, f *workflow.File, task *work
 				ctxMu.Unlock()
 			}
 
-			if sr.Status == workflow.StepFailed && sr.Error != nil {
+			if (sr.Status == workflow.StepFailed || sr.Status == workflow.StepBlocked) && sr.Error != nil {
 				step := findStep(task.Steps, sr.StepName)
 				if step == nil || step.OnFailure == workflow.OnFailureStop || step.OnFailure == "" {
 					result.Error = sr.Error
@@ -171,6 +174,16 @@ func (o *Orchestrator) runTask(ctx context.Context, f *workflow.File, task *work
 			o.log.Debug("stopped at level", "level", levelIdx)
 			break
 		}
+	}
+
+	// Surface capabilities the agent needed but didn't have access to —
+	// non-blocking, helps catch a missing scope/step declaration.
+	for _, d := range ag.Denied() {
+		result.Denied = append(result.Denied, workflow.DeniedCapability{
+			Step:   d.Step,
+			Tool:   d.Tool,
+			Reason: d.Reason,
+		})
 	}
 
 	return result
@@ -244,7 +257,7 @@ func (o *Orchestrator) execStep(
 	// ── Fast path: capability-only, all args specified ─────────────────
 	// No reasoning needed — run caps directly and return.
 	if step.Kind == "" && allCapsSpecified(step.CapCalls, capArgs) {
-		return o.execCapsDirectly(ctx, step, stepCapNames, capArgs, ag, importedCtx)
+		return o.execCapsDirectly(ctx, use, step, stepCapNames, capArgs, ag, importedCtx)
 	}
 
 	// ── Nothing to do ──────────────────────────────────────────────────
@@ -283,8 +296,10 @@ func (o *Orchestrator) execStep(
 
 // execCapsDirectly runs fully-specified capability-only steps without the agent.
 // Example: execute("go test ./...") — nothing to reason about, just run it.
+// Still passes through Guard — fully-specified doesn't mean unguarded.
 func (o *Orchestrator) execCapsDirectly(
 	ctx context.Context,
+	use *workflow.UseConfig,
 	step *workflow.Step,
 	capNames []string,
 	capArgs map[string]map[string]string,
@@ -300,6 +315,17 @@ func (o *Orchestrator) execCapsDirectly(
 			continue
 		}
 		input := capability.Input(capArgs[name])
+
+		if v := o.grd.Check(use.Scope, use.Policies, capNames, name, input); v != nil {
+			o.log.Warn("guard blocked", "step", step.Name, "cap", name, "reason", v.Message)
+			ag.RecordDenied(step.Name, name, v.Message)
+			return &workflow.StepResult{
+				StepName: step.Name,
+				Status:   workflow.StepBlocked,
+				Error:    v,
+			}
+		}
+
 		result := o.caps.Execute(ctx, name, input)
 		if result.Error != nil {
 			if step.OnFailure == workflow.OnFailureContinue {
