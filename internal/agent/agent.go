@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/dominionthedev/loom/internal/capability"
+	"github.com/dominionthedev/loom/internal/guard"
 	"github.com/dominionthedev/loom/internal/model"
 	"github.com/dominionthedev/loom/internal/storage"
 	"github.com/dominionthedev/loom/internal/workflow"
@@ -34,18 +35,30 @@ type StepOutput struct {
 // nil = silent.
 type LogFunc func(event, detail string)
 
+// DeniedRequest records a capability the agent attempted but couldn't access —
+// either it wasn't declared in the step/scope, or Guard blocked it (path/policy).
+// Collected for the end-of-run report so a developer can catch a missing
+// declaration that wasn't intentional.
+type DeniedRequest struct {
+	Step   string
+	Tool   string
+	Reason string
+}
+
 // Agent is a constrained reasoning instance, one per task.
 type Agent struct {
-	def             *workflow.AgentDef
-	use             *workflow.UseConfig
-	caps            *capability.Registry
-	store           *storage.Store
-	router          *model.Router
-	log             LogFunc
+	def    *workflow.AgentDef
+	use    *workflow.UseConfig
+	caps   *capability.Registry
+	store  *storage.Store
+	router *model.Router
+	log    LogFunc
+	grd    *guard.Guard
 
 	mu              sync.RWMutex
 	history         []model.Turn
 	exportedContext map[string]string // step name → exported context
+	denied          []DeniedRequest
 }
 
 // New creates an Agent for a task.
@@ -67,6 +80,7 @@ func New(
 		store:           store,
 		router:          router,
 		log:             logFn,
+		grd:             guard.New(caps),
 		exportedContext: make(map[string]string),
 	}
 }
@@ -134,7 +148,7 @@ func (a *Agent) RunStep(
 		}
 
 		// Execute the tool.
-		toolResult := a.executeTool(ctx, tc, capArgs, stepCapNames)
+		toolResult := a.executeTool(ctx, step.Name, tc, capArgs, stepCapNames)
 		toolOutputs[tc.Tool] = toolResult
 
 		if a.log != nil {
@@ -148,27 +162,26 @@ func (a *Agent) RunStep(
 }
 
 // executeTool runs a tool call from the agent.
-// Static args always override agent-provided input.
+// Every call passes through Guard — scope, step declaration, path,
+// command-path heuristic, and policy. Static args always override
+// agent-provided input for the same field.
 func (a *Agent) executeTool(
 	ctx context.Context,
+	stepName string,
 	tc *ToolCall,
 	capArgs map[string]map[string]string,
 	allowedCaps []string,
 ) string {
-	// Verify tool is in allowed set.
-	allowed := false
-	for _, name := range allowedCaps {
-		if name == tc.Tool {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return fmt.Sprintf("error: tool %q not available in this step", tc.Tool)
-	}
-
 	staticArgs := capability.Input(capArgs[tc.Tool])
 	merged := staticArgs.Merge(tc.Input)
+
+	if v := a.grd.Check(a.use.Scope, a.use.Policies, allowedCaps, tc.Tool, merged); v != nil {
+		a.recordDenied(stepName, tc.Tool, v.Message)
+		if a.log != nil {
+			a.log("guard:blocked", v.Message)
+		}
+		return fmt.Sprintf("blocked: %s", v.Message)
+	}
 
 	if a.log != nil {
 		a.log("tool:call", fmt.Sprintf("%s %v", tc.Tool, merged))
@@ -179,6 +192,30 @@ func (a *Agent) executeTool(
 		return fmt.Sprintf("error: %v", result.Error)
 	}
 	return result.Output
+}
+
+// RecordDenied tracks a capability that was attempted but denied.
+// Exposed so both the agent loop and the orchestrator's fast path
+// (capability-only steps) can report into the same denied list.
+func (a *Agent) RecordDenied(step, tool, reason string) {
+	a.recordDenied(step, tool, reason)
+}
+
+// recordDenied tracks a capability the agent attempted but couldn't access.
+func (a *Agent) recordDenied(step, tool, reason string) {
+	a.mu.Lock()
+	a.denied = append(a.denied, DeniedRequest{Step: step, Tool: tool, Reason: reason})
+	a.mu.Unlock()
+}
+
+// Denied returns all capabilities the agent attempted but was denied,
+// across every step run by this agent instance.
+func (a *Agent) Denied() []DeniedRequest {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	out := make([]DeniedRequest, len(a.denied))
+	copy(out, a.denied)
+	return out
 }
 
 // Export marks a step's full context as available downstream.
