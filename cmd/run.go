@@ -85,6 +85,9 @@ var runCmd = &cobra.Command{
 		}
 		fmt.Println()
 
+		// ── Denied capabilities — non-blocking report ──────────────────
+		printDeniedReport(result.Tasks)
+
 		if result.Error != nil {
 			fmt.Fprintf(os.Stderr, "  failed: %v\n", result.Error)
 			os.Exit(1)
@@ -93,6 +96,30 @@ var runCmd = &cobra.Command{
 		fmt.Fprintln(os.Stderr, "  done.")
 		return nil
 	},
+}
+
+// printDeniedReport surfaces capabilities the agent needed but didn't have
+// access to. Non-blocking — just flags a possible missing declaration.
+func printDeniedReport(tasks []*workflow.TaskResult) {
+	var any bool
+	for _, tr := range tasks {
+		if len(tr.Denied) > 0 {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+
+	fmt.Println("  ⚠ capabilities the agent needed but didn't have access to:")
+	for _, tr := range tasks {
+		for _, d := range tr.Denied {
+			fmt.Printf("      task=%s step=%s tool=%s — %s\n", tr.TaskName, d.Step, d.Tool, d.Reason)
+		}
+	}
+	fmt.Println("    add these to scope/step capabilities if the agent should have access.")
+	fmt.Println()
 }
 
 func printStepResult(sr *workflow.StepResult) {
