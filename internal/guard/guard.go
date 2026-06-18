@@ -1,6 +1,6 @@
 // Package guard enforces every operational boundary in Loom.
-// It sits between the orchestrator and every capability execution.
-// Nothing runs that isn't permitted by scope + policy + step declaration.
+// Every capability call — from the agent loop and from the fast path —
+// passes through Guard.Check before it executes.
 package guard
 
 import (
@@ -14,7 +14,7 @@ import (
 
 // Violation is a Guard enforcement failure.
 type Violation struct {
-	Rule    string // which rule fired
+	Rule    string
 	Message string
 }
 
@@ -33,21 +33,24 @@ func New(caps *capability.Registry) *Guard {
 }
 
 // Check validates a capability call against:
-//  1. Scope — is the capability declared?
-//  2. Step access — is the capability called in this step?
-//  3. Path — does the path match include/exclude patterns?
-//  4. Policy — does the call match any deny/allow/limit rule?
+//  1. Scope        — is the capability declared at all?
+//  2. Step          — is the capability declared in this step?
+//  3. Path          — does the path match include/exclude globs?
+//  4. Command paths — does the shell command reference an excluded path?
+//  5. Policy        — deny/allow/limit by capability + match pattern.
 //
+// allowedCaps is the step's declared capability set (all_capabilities()
+// already expanded to concrete names by the caller).
 // Returns nil if execution is permitted.
 func (g *Guard) Check(
 	scope *workflow.Scope,
 	policies []*workflow.Policy,
-	stepCaps []workflow.CapCall,
+	allowedCaps []string,
 	capName string,
 	input capability.Input,
 ) *Violation {
 
-	// ── 1. Scope enforcement ──────────────────────────────────────────
+	// 1. Scope.
 	if !scope.AllowsCapability(capName) {
 		return &Violation{
 			Rule:    "scope.capability",
@@ -55,15 +58,15 @@ func (g *Guard) Check(
 		}
 	}
 
-	// ── 2. Step access enforcement ────────────────────────────────────
-	if !stepAllows(stepCaps, capName) {
+	// 2. Step.
+	if !contains(allowedCaps, capName) {
 		return &Violation{
 			Rule:    "step.capability",
-			Message: fmt.Sprintf("capability %q is not declared in this step", capName),
+			Message: fmt.Sprintf("capability %q is not declared in this step — add it to the step or scope if the agent needs it", capName),
 		}
 	}
 
-	// ── 3. Path enforcement (filesystem capabilities) ─────────────────
+	// 3. Path — filesystem capabilities respect include/exclude globs.
 	if isFilesystemCap(capName) {
 		if path, ok := input["path"]; ok && path != "" {
 			if v := g.checkPath(scope, capName, path); v != nil {
@@ -72,15 +75,22 @@ func (g *Guard) Check(
 		}
 	}
 
-	// ── 4. Policy enforcement ─────────────────────────────────────────
-	cap := g.caps.Get(capName)
-	var contract capability.Contract
-	if cap != nil {
-		if contracted, ok := cap.(capability.Contracted); ok {
-			contract = contracted.Contract()
+	// 4. Command path scan — best-effort, process capabilities only.
+	if isProcessCap(capName) {
+		if cmd, ok := input["cmd"]; ok && cmd != "" {
+			if v := g.checkCommandPaths(scope, capName, cmd); v != nil {
+				return v
+			}
 		}
 	}
 
+	// 5. Policy.
+	var contract capability.Contract
+	if c := g.caps.Get(capName); c != nil {
+		if contracted, ok := c.(capability.Contracted); ok {
+			contract = contracted.Contract()
+		}
+	}
 	for _, p := range policies {
 		if v := checkPolicy(p, capName, contract, input); v != nil {
 			return v
@@ -94,7 +104,6 @@ func (g *Guard) Check(
 func (g *Guard) checkPath(scope *workflow.Scope, capName, path string) *Violation {
 	path = filepath.ToSlash(filepath.Clean(path))
 
-	// Excludes win over includes.
 	for _, pattern := range scope.Exclude {
 		if globMatch(pattern, path) {
 			return &Violation{
@@ -104,7 +113,6 @@ func (g *Guard) checkPath(scope *workflow.Scope, capName, path string) *Violatio
 		}
 	}
 
-	// If includes declared, path must match at least one.
 	if len(scope.Include) > 0 {
 		for _, pattern := range scope.Include {
 			if globMatch(pattern, path) {
@@ -120,6 +128,49 @@ func (g *Guard) checkPath(scope *workflow.Scope, capName, path string) *Violatio
 	return nil
 }
 
+// checkCommandPaths scans a shell command string for path-like tokens and
+// blocks any that match an EXCLUDED pattern. It deliberately does NOT
+// require an include match — command arguments are often flags or globs
+// ("./...", "-v", "**/*_test.go"), not literal files, and requiring strict
+// inclusion would produce constant false positives (blocking "go test ./...").
+//
+// This is a heuristic, not a sandbox. It catches the obvious case — an
+// agent running `cat .env` or `rm -rf secrets/` — but it can be bypassed
+// by quoting, piping, or encoding. Real isolation requires a runbox-backed
+// execution environment (future).
+func (g *Guard) checkCommandPaths(scope *workflow.Scope, capName, cmd string) *Violation {
+	for _, token := range extractPathTokens(cmd) {
+		clean := filepath.ToSlash(filepath.Clean(token))
+		for _, pattern := range scope.Exclude {
+			if globMatch(pattern, clean) {
+				return &Violation{
+					Rule:    "scope.command.exclude",
+					Message: fmt.Sprintf("%s: command references excluded path %q (pattern %q)", capName, token, pattern),
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// extractPathTokens does a best-effort scan for path-like tokens in a
+// shell command: whitespace-split, skip flags, keep tokens containing
+// '/' or '.'.
+func extractPathTokens(cmd string) []string {
+	fields := strings.Fields(cmd)
+	var tokens []string
+	for _, f := range fields {
+		f = strings.Trim(f, `"'`)
+		if f == "" || strings.HasPrefix(f, "-") {
+			continue
+		}
+		if strings.Contains(f, "/") || strings.Contains(f, ".") {
+			tokens = append(tokens, f)
+		}
+	}
+	return tokens
+}
+
 // checkPolicy evaluates one policy rule against a capability call.
 func checkPolicy(
 	p *workflow.Policy,
@@ -128,7 +179,6 @@ func checkPolicy(
 	input capability.Input,
 ) *Violation {
 
-	// Only apply this policy if the target matches the capability.
 	if p.Target != capName && p.Target != "" {
 		return nil
 	}
@@ -136,19 +186,17 @@ func checkPolicy(
 	switch p.Kind {
 
 	case workflow.PolicyDeny:
-		// Check against match patterns for process capabilities (command matching).
 		if isProcessCap(capName) {
 			cmd := input["cmd"]
 			for _, pattern := range p.Match {
 				if globMatch(pattern, cmd) {
 					return &Violation{
 						Rule:    "policy.deny",
-						Message: fmt.Sprintf("policy %q: capability %q with command %q is denied by pattern %q", p.Name, capName, cmd, pattern),
+						Message: fmt.Sprintf("policy %q: %q matches denied pattern %q", p.Name, cmd, pattern),
 					}
 				}
 			}
 		}
-		// For non-process caps with no match patterns: deny the whole capability.
 		if !isProcessCap(capName) && len(p.Match) == 0 {
 			return &Violation{
 				Rule:    "policy.deny",
@@ -157,17 +205,16 @@ func checkPolicy(
 		}
 
 	case workflow.PolicyLimit:
-		// Allow only if the path/command matches one of the patterns.
 		if isProcessCap(capName) {
 			cmd := input["cmd"]
 			for _, pattern := range p.Match {
 				if globMatch(pattern, cmd) {
-					return nil // permitted
+					return nil
 				}
 			}
 			return &Violation{
 				Rule:    "policy.limit",
-				Message: fmt.Sprintf("policy %q: command %q does not match any allowed pattern", p.Name, cmd),
+				Message: fmt.Sprintf("policy %q: %q does not match any allowed pattern", p.Name, cmd),
 			}
 		}
 		if isFilesystemCap(capName) {
@@ -184,38 +231,26 @@ func checkPolicy(
 		}
 
 	case workflow.PolicyAllow:
-		// Explicit allow — no violation.
 		return nil
 	}
 
 	return nil
 }
 
-// stepAllows checks if a capability was declared in the step's cap calls.
-func stepAllows(calls []workflow.CapCall, capName string) bool {
-	for _, c := range calls {
-		if c.All {
-			return true // all_capabilities()
-		}
-		if c.Name == capName {
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
 			return true
 		}
 	}
 	return false
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+func isFilesystemCap(name string) bool { return strings.HasPrefix(name, "filesystem.") }
+func isProcessCap(name string) bool    { return strings.HasPrefix(name, "process.") }
 
-func isFilesystemCap(name string) bool {
-	return strings.HasPrefix(name, "filesystem.")
-}
-
-func isProcessCap(name string) bool {
-	return strings.HasPrefix(name, "process.")
-}
-
-// globMatch matches a glob pattern against a target string.
-// Supports ** for multi-segment wildcards.
 func globMatch(pattern, target string) bool {
 	if pattern == target {
 		return true
@@ -237,15 +272,12 @@ func doubleStarMatch(pattern, target string) bool {
 		}
 		target = target[len(prefix):]
 	}
-
 	if suffix == "" {
 		return true
 	}
-
 	if strings.HasSuffix(target, suffix) {
 		return true
 	}
-
 	segments := strings.Split(target, "/")
 	for i := range segments {
 		candidate := strings.Join(segments[i:], "/")
