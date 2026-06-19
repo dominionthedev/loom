@@ -143,6 +143,14 @@ type CapCall struct {
 	Args   []string // explicit args (empty = open, policy-filtered)
 	All    bool     // all_capabilities() — full scope access
 	Custom bool     // capability("name") — user-defined
+
+	// ArtifactsScope is true for read(artifacts) / write(artifacts).
+	// This is NOT a literal path — it restricts the capability's domain
+	// to .loom/artifacts/. The agent still chooses which file by name;
+	// the runtime resolves it relative to the artifacts dir and exempts
+	// it from the project scope's include/exclude path check (Loom's own
+	// storage isn't part of the project source the scope restricts).
+	ArtifactsScope bool
 }
 
 // ArtifactRef is an artifact operation inside a step.
