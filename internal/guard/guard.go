@@ -41,6 +41,13 @@ func New(caps *capability.Registry) *Guard {
 //
 // allowedCaps is the step's declared capability set (all_capabilities()
 // already expanded to concrete names by the caller).
+//
+// artifactsCall is true for read(artifacts)/write(artifacts) calls — these
+// operate inside .loom/artifacts/, which is Loom's own storage, not part
+// of the project source the scope's include/exclude restricts. Step 3 is
+// skipped for these; the caller is responsible for resolving the path
+// into the artifacts directory and verifying it doesn't escape it.
+//
 // Returns nil if execution is permitted.
 func (g *Guard) Check(
 	scope *workflow.Scope,
@@ -48,6 +55,7 @@ func (g *Guard) Check(
 	allowedCaps []string,
 	capName string,
 	input capability.Input,
+	artifactsCall bool,
 ) *Violation {
 
 	// 1. Scope.
@@ -67,7 +75,8 @@ func (g *Guard) Check(
 	}
 
 	// 3. Path — filesystem capabilities respect include/exclude globs.
-	if isFilesystemCap(capName) {
+	// Skipped for artifacts-domain calls (see doc comment above).
+	if !artifactsCall && isFilesystemCap(capName) {
 		if path, ok := input["path"]; ok && path != "" {
 			if v := g.checkPath(scope, capName, path); v != nil {
 				return v
