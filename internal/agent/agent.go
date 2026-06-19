@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -87,11 +88,16 @@ func New(
 
 // RunStep executes a step's agent loop.
 // For parallel steps, a snapshot of history is used — thread-safe.
+//
+// artifactsScoped marks which capability names were declared via
+// read(artifacts)/write(artifacts) — domain-restricted to .loom/artifacts/,
+// agent still chooses the filename.
 func (a *Agent) RunStep(
 	ctx context.Context,
 	step *workflow.Step,
 	stepCapNames []string,
 	capArgs map[string]map[string]string,
+	artifactsScoped map[string]bool,
 	accumulatedContext string,
 ) (*StepOutput, error) {
 
@@ -100,7 +106,7 @@ func (a *Agent) RunStep(
 		m = a.router.For("high")
 	}
 
-	system := a.buildSystem(step, stepCapNames, capArgs)
+	system := a.buildSystem(step, stepCapNames, capArgs, artifactsScoped)
 	toolOutputs := make(map[string]string)
 
 	// Snapshot history for this step — safe for parallel execution.
@@ -148,7 +154,7 @@ func (a *Agent) RunStep(
 		}
 
 		// Execute the tool.
-		toolResult := a.executeTool(ctx, step.Name, tc, capArgs, stepCapNames)
+		toolResult := a.executeTool(ctx, step.Name, tc, capArgs, stepCapNames, artifactsScoped)
 		toolOutputs[tc.Tool] = toolResult
 
 		if a.log != nil {
@@ -165,17 +171,33 @@ func (a *Agent) RunStep(
 // Every call passes through Guard — scope, step declaration, path,
 // command-path heuristic, and policy. Static args always override
 // agent-provided input for the same field.
+//
+// For artifacts-scoped capabilities (read(artifacts)/write(artifacts)),
+// the agent-provided "path" is treated as a filename relative to
+// .loom/artifacts/ — resolved here, before Guard sees it, and Guard
+// skips the project-scope path check for the resolved path.
 func (a *Agent) executeTool(
 	ctx context.Context,
 	stepName string,
 	tc *ToolCall,
 	capArgs map[string]map[string]string,
 	allowedCaps []string,
+	artifactsScoped map[string]bool,
 ) string {
 	staticArgs := capability.Input(capArgs[tc.Tool])
 	merged := staticArgs.Merge(tc.Input)
 
-	if v := a.grd.Check(a.use.Scope, a.use.Policies, allowedCaps, tc.Tool, merged); v != nil {
+	isArtifactsCall := artifactsScoped[tc.Tool]
+	if isArtifactsCall {
+		resolved, err := a.resolveArtifactPath(merged["path"])
+		if err != nil {
+			a.recordDenied(stepName, tc.Tool, err.Error())
+			return fmt.Sprintf("error: %v", err)
+		}
+		merged["path"] = resolved
+	}
+
+	if v := a.grd.Check(a.use.Scope, a.use.Policies, allowedCaps, tc.Tool, merged, isArtifactsCall); v != nil {
 		a.recordDenied(stepName, tc.Tool, v.Message)
 		if a.log != nil {
 			a.log("guard:blocked", v.Message)
@@ -192,6 +214,19 @@ func (a *Agent) executeTool(
 		return fmt.Sprintf("error: %v", result.Error)
 	}
 	return result.Output
+}
+
+// resolveArtifactPath resolves an agent-provided filename to a path inside
+// .loom/artifacts/, rejecting anything that would escape the directory.
+func (a *Agent) resolveArtifactPath(rel string) (string, error) {
+	if rel == "" {
+		return "", fmt.Errorf("artifacts capability: provide a 'path' — the artifact filename, e.g. \"analysis.md\"")
+	}
+	clean := filepath.Clean(rel)
+	if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+		return "", fmt.Errorf("artifacts capability: path %q must be a filename inside the artifacts directory, not an absolute or escaping path", rel)
+	}
+	return filepath.Join(a.store.ArtifactsDir(), clean), nil
 }
 
 // RecordDenied tracks a capability that was attempted but denied.
@@ -237,6 +272,7 @@ func (a *Agent) buildSystem(
 	step *workflow.Step,
 	stepCapNames []string,
 	capArgs map[string]map[string]string,
+	artifactsScoped map[string]bool,
 ) string {
 	var sb strings.Builder
 
@@ -273,6 +309,16 @@ func (a *Agent) buildSystem(
 		sb.WriteString("Available tools:\n")
 		sb.WriteString(a.caps.DescribeForAgent(stepCapNames, capArgs))
 		sb.WriteString("\n")
+	}
+
+	for _, name := range stepCapNames {
+		if artifactsScoped[name] {
+			sb.WriteString(fmt.Sprintf(
+				"Note: %s is restricted to Loom's artifacts directory for this step. "+
+					"Provide 'path' as just the artifact filename (e.g. \"analysis.md\"), not a full or relative project path.\n\n",
+				name,
+			))
+		}
 	}
 
 	sb.WriteString(`When you need to use a tool, respond with EXACTLY this format and nothing else:
