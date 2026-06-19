@@ -88,7 +88,6 @@ use({
 task("plan", {
     step("load-analysis", {
         artifacts("analysis.md"),
-        read(artifacts),
         export()
     }),
 
@@ -122,7 +121,6 @@ use({
 task("implement", {
     step("load-plan", {
         artifacts("fix-plan.md"),
-        read(artifacts),
         export()
     }),
 
