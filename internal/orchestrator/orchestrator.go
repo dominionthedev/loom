@@ -252,7 +252,7 @@ func (o *Orchestrator) execStep(
 		}
 	}
 
-	stepCapNames, capArgs := buildCapSets(step.CapCalls, use.Scope)
+	stepCapNames, capArgs, artifactsScoped := buildCapSets(step.CapCalls, use.Scope)
 
 	// ── Fast path: capability-only, all args specified ─────────────────
 	// No reasoning needed — run caps directly and return.
@@ -261,12 +261,19 @@ func (o *Orchestrator) execStep(
 	}
 
 	// ── Nothing to do ──────────────────────────────────────────────────
+	// No reasoning, no capabilities — but artifact refs may have already
+	// loaded content into importedCtx (e.g. a pure "load this artifact"
+	// bridge step between tasks). Still export it if asked, or depends_on
+	// in the next task silently loses that context.
 	if step.Kind == "" && len(stepCapNames) == 0 {
+		if step.Export && importedCtx != "" {
+			ag.Export(step.Name, &agent.StepOutput{Context: importedCtx})
+		}
 		return &workflow.StepResult{StepName: step.Name, Status: workflow.StepOK}
 	}
 
 	// ── Agent path: hand off to agent loop ─────────────────────────────
-	out, err := ag.RunStep(ctx, step, stepCapNames, capArgs, importedCtx)
+	out, err := ag.RunStep(ctx, step, stepCapNames, capArgs, artifactsScoped, importedCtx)
 	if err != nil {
 		return &workflow.StepResult{
 			StepName: step.Name,
@@ -316,7 +323,7 @@ func (o *Orchestrator) execCapsDirectly(
 		}
 		input := capability.Input(capArgs[name])
 
-		if v := o.grd.Check(use.Scope, use.Policies, capNames, name, input); v != nil {
+		if v := o.grd.Check(use.Scope, use.Policies, capNames, name, input, false); v != nil {
 			o.log.Warn("guard blocked", "step", step.Name, "cap", name, "reason", v.Message)
 			ag.RecordDenied(step.Name, name, v.Message)
 			return &workflow.StepResult{
@@ -363,6 +370,9 @@ func allCapsSpecified(calls []workflow.CapCall, capArgs map[string]map[string]st
 		if c.All {
 			return false // all_capabilities() always needs agent
 		}
+		if c.ArtifactsScope {
+			return false // agent must choose which artifact file by name
+		}
 		if _, hasArgs := capArgs[c.Name]; !hasArgs {
 			return false // this cap needs agent input
 		}
@@ -407,9 +417,11 @@ func (o *Orchestrator) runReviewGate(artifactPath string) error {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-// buildCapSets builds the capability name list and args map from CapCalls.
-func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, map[string]map[string]string) {
+// buildCapSets builds the capability name list, args map, and the
+// artifacts-scoped set from CapCalls.
+func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, map[string]map[string]string, map[string]bool) {
 	args := make(map[string]map[string]string)
+	artifactsScoped := make(map[string]bool)
 	seen := make(map[string]bool)
 	var names []string
 
@@ -432,6 +444,15 @@ func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, ma
 			names = append(names, c.Name)
 			seen[c.Name] = true
 		}
+
+		if c.ArtifactsScope {
+			// Domain restriction, not a literal value — the agent still
+			// chooses the filename. Don't set a "path" arg; executeTool
+			// resolves it relative to .loom/artifacts/ at call time.
+			artifactsScoped[c.Name] = true
+			continue
+		}
+
 		if len(c.Args) > 0 {
 			if args[c.Name] == nil {
 				args[c.Name] = make(map[string]string)
@@ -453,7 +474,7 @@ func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, ma
 		}
 	}
 
-	return names, args
+	return names, args, artifactsScoped
 }
 
 func kindOf(k workflow.StepKind) string {
