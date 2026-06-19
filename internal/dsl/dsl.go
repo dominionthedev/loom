@@ -407,12 +407,13 @@ func registerStepPrimitives(L *lua.LState) {
 	})
 
 	// read("pattern" | artifacts)
-	// If artifacts (an LFunction) is passed, treat as __artifacts__ sentinel.
+	// artifacts is a domain restriction, NOT a literal path — marked
+	// separately so it never gets treated as a fixed path value.
 	op("read", func(L *lua.LState, t *lua.LTable) {
 		if L.GetTop() >= 1 {
 			v := L.Get(1)
 			if _, isFunc := v.(*lua.LFunction); isFunc {
-				t.RawSetString("target", lua.LString("__artifacts__"))
+				t.RawSetString("artifacts_scope", lua.LTrue)
 			} else {
 				t.RawSetString("target", v)
 			}
@@ -425,7 +426,7 @@ func registerStepPrimitives(L *lua.LState) {
 		if L.GetTop() >= 1 {
 			v := L.Get(1)
 			if _, isFunc := v.(*lua.LFunction); isFunc {
-				t.RawSetString("target", lua.LString("__artifacts__"))
+				t.RawSetString("artifacts_scope", lua.LTrue)
 			} else {
 				t.RawSetString("target", v)
 			}
@@ -651,24 +652,22 @@ func tableToStep(tbl *lua.LTable) *workflow.Step {
 			seenWrite = true // plan produces an artifact
 
 		case "read":
-			target := ""
-			if tv := opTbl.RawGetString("target"); tv != lua.LNil {
-				target = string(tv.(lua.LString))
+			call := workflow.CapCall{Name: "filesystem.read"}
+			if av := opTbl.RawGetString("artifacts_scope"); av != lua.LNil {
+				call.ArtifactsScope = true
+			} else if tv := opTbl.RawGetString("target"); tv != lua.LNil {
+				call.Args = nonEmpty(string(tv.(lua.LString)))
 			}
-			step.CapCalls = append(step.CapCalls, workflow.CapCall{
-				Name: "filesystem.read",
-				Args: nonEmpty(target),
-			})
+			step.CapCalls = append(step.CapCalls, call)
 
 		case "write":
-			target := ""
-			if tv := opTbl.RawGetString("target"); tv != lua.LNil {
-				target = string(tv.(lua.LString))
+			call := workflow.CapCall{Name: "filesystem.write"}
+			if av := opTbl.RawGetString("artifacts_scope"); av != lua.LNil {
+				call.ArtifactsScope = true
+			} else if tv := opTbl.RawGetString("target"); tv != lua.LNil {
+				call.Args = nonEmpty(string(tv.(lua.LString)))
 			}
-			step.CapCalls = append(step.CapCalls, workflow.CapCall{
-				Name: "filesystem.write",
-				Args: nonEmpty(target),
-			})
+			step.CapCalls = append(step.CapCalls, call)
 			seenWrite = true
 
 		case "execute":
