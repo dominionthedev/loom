@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/dominionthedev/loom/internal/globutil"
 )
 
 // ── Field schema ───────────────────────────────────────────────────────────
@@ -331,7 +333,7 @@ func (f *fsGlob) Execute(_ context.Context, input Input) Result {
 	if pattern == "" {
 		return Result{Error: fmt.Errorf("filesystem.glob: missing 'pattern'")}
 	}
-	matches, err := filepath.Glob(pattern)
+	matches, err := globutil.Glob(pattern)
 	if err != nil {
 		return Result{Error: fmt.Errorf("filesystem.glob: %w", err)}
 	}
