@@ -325,6 +325,10 @@ func (a *Agent) buildSystem(
 TOOL: tool_name
 INPUT: key1=value1 key2=value2
 
+Do not wrap values in quotes. Write path=internal/shell/shell_test.go,
+not path="internal/shell/shell_test.go" — the quote characters become
+part of the value and the file will not be found.
+
 TOOL: must be the very first thing in your reply, on its own line — never
 preface it with explanation text on the same line ("Let me check this:TOOL: ..."
 is wrong). If you want to explain your reasoning, do it in a separate message
@@ -470,9 +474,26 @@ func parseKV(line string, input capability.Input, inML *bool, mlKey, mlVal *stri
 	val = strings.TrimPrefix(val, "<<<")
 	val = strings.TrimSuffix(val, ">>>")
 	val = strings.TrimSpace(val)
+	val = unquote(val)
 	if key != "" {
 		input[key] = val
 	}
+}
+
+// unquote strips one matching pair of surrounding quote characters.
+// Models frequently quote string values (path="some/file.go") even
+// though the format doesn't call for it. Left unstripped, the literal
+// quote characters become part of the value — a path that can then
+// never match any scope pattern — and Guard correctly but unhelpfully
+// blocks something that was actually a perfectly valid request.
+func unquote(s string) string {
+	if len(s) >= 2 {
+		first, last := s[0], s[len(s)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }
 
 func truncate(s string, n int) string {
