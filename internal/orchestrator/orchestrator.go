@@ -287,8 +287,22 @@ func (o *Orchestrator) execStep(
 	}
 
 	// Create artifacts after write/plan.
+	// Defense in depth: even with the parser fix for glued tool-call text,
+	// don't silently save something that still looks like a dangling,
+	// incomplete tool-call fragment as if it were a real, finished answer.
+	// A bad artifact poisons every downstream step that loads it.
 	for _, ref := range step.ArtifactRefs {
 		if ref.Create && ref.Name != "" && out.Answer != "" {
+			if reason := malformedAnswerReason(out.Answer); reason != "" {
+				return &workflow.StepResult{
+					StepName: step.Name,
+					Status:   workflow.StepFailed,
+					Error: fmt.Errorf(
+						"step %q produced a malformed final answer (%s) — refusing to save as artifact %q",
+						step.Name, reason, ref.Name,
+					),
+				}
+			}
 			kind := kindOf(step.Kind)
 			_ = o.store.SaveArtifact("", "", step.Name, ref.Name, kind, out.Answer)
 		}
@@ -475,6 +489,22 @@ func buildCapSets(calls []workflow.CapCall, scope *workflow.Scope) ([]string, ma
 	}
 
 	return names, args, artifactsScoped
+}
+
+// malformedAnswerReason returns a non-empty reason if answer looks like a
+// dangling tool-call fragment rather than a genuine finished response —
+// e.g. the model ran out of useful moves and its last reply happened not
+// to match the tool-call format, so it was treated as "final" by accident.
+// Empty return means the answer looks fine to save.
+func malformedAnswerReason(answer string) string {
+	if strings.Contains(answer, "TOOL:") && strings.Contains(answer, "INPUT:") {
+		return "contains a stray TOOL:/INPUT: fragment"
+	}
+	trimmed := strings.TrimSpace(answer)
+	if len(trimmed) < 10 {
+		return "suspiciously short"
+	}
+	return ""
 }
 
 func kindOf(k workflow.StepKind) string {
