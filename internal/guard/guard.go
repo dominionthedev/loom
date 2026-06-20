@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/dominionthedev/loom/internal/capability"
+	"github.com/dominionthedev/loom/internal/globutil"
 	"github.com/dominionthedev/loom/internal/workflow"
 )
 
@@ -114,7 +115,7 @@ func (g *Guard) checkPath(scope *workflow.Scope, capName, path string) *Violatio
 	path = filepath.ToSlash(filepath.Clean(path))
 
 	for _, pattern := range scope.Exclude {
-		if globMatch(pattern, path) {
+		if globutil.Match(pattern, path) {
 			return &Violation{
 				Rule:    "scope.path.exclude",
 				Message: fmt.Sprintf("%s: path %q is excluded by pattern %q", capName, path, pattern),
@@ -124,7 +125,7 @@ func (g *Guard) checkPath(scope *workflow.Scope, capName, path string) *Violatio
 
 	if len(scope.Include) > 0 {
 		for _, pattern := range scope.Include {
-			if globMatch(pattern, path) {
+			if globutil.Match(pattern, path) {
 				return nil
 			}
 		}
@@ -151,7 +152,7 @@ func (g *Guard) checkCommandPaths(scope *workflow.Scope, capName, cmd string) *V
 	for _, token := range extractPathTokens(cmd) {
 		clean := filepath.ToSlash(filepath.Clean(token))
 		for _, pattern := range scope.Exclude {
-			if globMatch(pattern, clean) {
+			if globutil.Match(pattern, clean) {
 				return &Violation{
 					Rule:    "scope.command.exclude",
 					Message: fmt.Sprintf("%s: command references excluded path %q (pattern %q)", capName, token, pattern),
@@ -198,7 +199,7 @@ func checkPolicy(
 		if isProcessCap(capName) {
 			cmd := input["cmd"]
 			for _, pattern := range p.Match {
-				if globMatch(pattern, cmd) {
+				if globutil.Match(pattern, cmd) {
 					return &Violation{
 						Rule:    "policy.deny",
 						Message: fmt.Sprintf("policy %q: %q matches denied pattern %q", p.Name, cmd, pattern),
@@ -217,7 +218,7 @@ func checkPolicy(
 		if isProcessCap(capName) {
 			cmd := input["cmd"]
 			for _, pattern := range p.Match {
-				if globMatch(pattern, cmd) {
+				if globutil.Match(pattern, cmd) {
 					return nil
 				}
 			}
@@ -229,7 +230,7 @@ func checkPolicy(
 		if isFilesystemCap(capName) {
 			path := filepath.ToSlash(input["path"])
 			for _, pattern := range p.Match {
-				if globMatch(pattern, path) {
+				if globutil.Match(pattern, path) {
 					return nil
 				}
 			}
@@ -259,40 +260,3 @@ func contains(list []string, s string) bool {
 
 func isFilesystemCap(name string) bool { return strings.HasPrefix(name, "filesystem.") }
 func isProcessCap(name string) bool    { return strings.HasPrefix(name, "process.") }
-
-func globMatch(pattern, target string) bool {
-	if pattern == target {
-		return true
-	}
-	if strings.Contains(pattern, "**") {
-		return doubleStarMatch(pattern, target)
-	}
-	matched, _ := filepath.Match(pattern, target)
-	return matched
-}
-
-func doubleStarMatch(pattern, target string) bool {
-	parts := strings.SplitN(pattern, "**", 2)
-	prefix, suffix := parts[0], strings.TrimPrefix(parts[1], "/")
-
-	if prefix != "" {
-		if !strings.HasPrefix(target, prefix) {
-			return false
-		}
-		target = target[len(prefix):]
-	}
-	if suffix == "" {
-		return true
-	}
-	if strings.HasSuffix(target, suffix) {
-		return true
-	}
-	segments := strings.Split(target, "/")
-	for i := range segments {
-		candidate := strings.Join(segments[i:], "/")
-		if matched, _ := filepath.Match(suffix, candidate); matched {
-			return true
-		}
-	}
-	return false
-}
