@@ -57,16 +57,21 @@ var runCmd = &cobra.Command{
 
 		caps := capability.New()
 
+		logger := log.New(os.Stderr)
+		if flagVerbose {
+			logger.SetLevel(log.DebugLevel)
+		}
+
 		modelCfg := model.Config{
 			Default: flagModel,
 			Medium:  flagModelMid,
 			High:    flagModelHigh,
 		}
 		router := model.NewRouter(modelCfg)
-
-		logger := log.New(os.Stderr)
 		if flagVerbose {
-			logger.SetLevel(log.DebugLevel)
+			router.OnRetry = func(modelName string, attempt, max int, err error) {
+				logger.Debug("model:retry", "model", modelName, "attempt", attempt, "max", max, "err", err)
+			}
 		}
 
 		orch := orchestrator.New(caps, router, store, logger, flagVerbose)
