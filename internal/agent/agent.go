@@ -325,13 +325,18 @@ func (a *Agent) buildSystem(
 TOOL: tool_name
 INPUT: key1=value1 key2=value2
 
+TOOL: must be the very first thing in your reply, on its own line — never
+preface it with explanation text on the same line ("Let me check this:TOOL: ..."
+is wrong). If you want to explain your reasoning, do it in a separate message
+before deciding to call a tool, not glued onto the call itself.
+
 For multi-line content use:
 TOOL: tool_name
 INPUT: key=<<<
 content here
 >>>
 
-When finished, respond with plain text only (no TOOL: prefix).
+When finished, respond with plain text only (no TOOL: anywhere in the reply).
 Do not explain tool calls. Be precise and minimal.
 `)
 
@@ -385,11 +390,24 @@ func buildContextString(stepName, answer string, toolOutputs map[string]string, 
 
 // ── Tool call parsing ──────────────────────────────────────────────────────
 
+// parseToolCall attempts to parse a model response as a tool call.
+// Returns nil if no TOOL: marker is found anywhere (a genuine final answer).
+//
+// Models occasionally glue prose directly onto a tool call with no
+// separator ("Let me check this:TOOL: filesystem.glob"), which a strict
+// prefix check would miss entirely — the whole reply gets misread as a
+// final answer, the agent loop ends early, and whatever half-formed text
+// preceded the call can end up saved as a "finished" artifact. Searching
+// for TOOL: anywhere and discarding everything before it is deliberately
+// permissive — the system prompt already reserves TOOL: as a keyword, so
+// a false match on ordinary prose is unlikely.
 func parseToolCall(response string) *ToolCall {
 	response = strings.TrimSpace(response)
-	if !strings.HasPrefix(response, "TOOL:") {
+	idx := strings.Index(response, "TOOL:")
+	if idx < 0 {
 		return nil
 	}
+	response = response[idx:]
 
 	tc := &ToolCall{Input: make(capability.Input)}
 	lines := strings.Split(response, "\n")
